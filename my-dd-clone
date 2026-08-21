@@ -1,0 +1,1117 @@
+#!/bin/sh
+# my-dd-clone — block-clone the APFS physical store backing one volume onto
+# the one backing another, with dd on the raw devices. The copy runs detached
+# via nohup and survives closing the terminal; running my-dd-clone with no
+# arguments picks up running/finished jobs and shows their status.
+
+SCRIPT_NAME=my-dd-clone
+
+VRB=0
+DBG=0
+CLEAR=0
+GO=0
+ABORT=0
+EMERGENCY=0
+DIFF=0
+MAX=0
+RESUME_FLAG=0
+HAVE_RESUME=0
+RESUME_DONE=0
+RESUME_MAP=
+CONFIG_OVERRIDE=
+
+usage_short() {
+  cat <<EOF
+usage: $SCRIPT_NAME [-V] [-D] [-E] [--max] [--resume] [--config FILE] <SOURCE> <TARGET> [go]
+       $SCRIPT_NAME [-V] --diff <SOURCE> <TARGET> [go]
+       $SCRIPT_NAME [-V] [--clear]
+       $SCRIPT_NAME -A|abort [JOB [TARGET]] [go]
+       $SCRIPT_NAME --create-config [FILE]
+
+  SOURCE    an APFS volume: /Volumes/<NAME> or <NAME>
+  TARGET    another APFS volume, or a raw image file (path ending .img/.dmg)
+  go        actually start; without it, analyze only and print the plan
+  (no arguments: the status view when clone jobs exist, else this usage)
+  (an unfinished clone of the same pair makes 'go' offer to RESUME it)
+
+  -V, --verbose          echo each command before running it
+  -D, --debug            debug diagnostics (implies -V)
+  -E, --emergency        dying-disk mode: careful multi-pass copy via ddrescue
+  -A, --abort, abort     list the running clones that would be aborted (all,
+                         or picked by pid / SOURCE [TARGET]); append 'go'
+                         to actually abort them
+      --diff             compare instead of clone: sha256 SOURCE vs TARGET
+      --max              after a successful clone onto a LARGER volume target:
+                         automatically grow the copied APFS container to fill
+                         the whole partition (see --help)
+      --resume           with 'go': resume the unfinished run without asking
+      --clear            drop finished/failed job records from the status view
+      --config FILE      use FILE as config, bypassing the search
+      --create-config [FILE]
+                         print the default config to stdout, or write it to FILE
+  -h                     this short usage
+      --help             full help: how it works, safety checks, config, caveat
+EOF
+}
+
+usage() {
+  usage_short
+  cat <<EOF
+
+Block-clones the APFS physical store backing volume SOURCE onto the one
+backing volume TARGET (dd over the raw /dev/rdiskXsY devices), or into a
+raw image FILE. A volume target DESTROYS everything in its container,
+including sibling volumes. .img is the recommended file extension: dd
+writes RAW bytes, not a UDIF .dmg; attach an image later with
+'hdiutil attach -imagekey diskimage-class=CRawDiskImage FILE'.
+
+How it works:
+  analyze   without 'go' nothing changes: volumes are resolved to their
+            physical stores, sizes/free space are checked, the plan is shown
+  go        the only word that starts it. sudo is validated up front, every
+            volume in the affected container(s) is unmounted (source only,
+            for a file target), then dd runs detached via nohup (wrapped in
+            /usr/bin/time -p) — it survives closing the terminal. A file
+            target is chown'd back to you when done.
+  resume    if an UNFINISHED run of the same SOURCE -> TARGET exists, 'go'
+            asks: type 'resume' to continue (dd: skip/seek to the old
+            offset minus a safety rewind; -E: reuse the mapfile) or 'new'.
+            --resume skips the question and resumes directly (for scripts).
+  status    with no SOURCE/TARGET, all recorded jobs are shown:
+            RUNNING/DONE/FAILED/ABORTED with bytes done, percent, rate,
+            ETA (rescued bytes + percent for -E jobs), elapsed (from the
+            recorded start/end timestamps), and real/user/sys CPU time.
+  abort     analyze-by-default too: -A/abort lists the running clones that
+            match (all, by pid, or by SOURCE [TARGET]); appending 'go'
+            TERMinates their copy processes, the wrappers record exit code
+            + end time themselves (no race), the jobs are marked ABORTED,
+            and a rerun with 'go' offers to resume.
+  --diff    compares instead of cloning: both sides are unmounted, each is
+            read exactly once and sha256'd over the source's length; the
+            verdict (IDENTICAL/DIFFER) appears in the status view.
+  --max     a clone onto a LARGER target leaves the copied APFS container
+            at the source's size — the partition tail stays unused. --max
+            runs 'diskutil apfs resizeContainer <targetStore> 0' (0 =
+            expand to fill the partition) automatically after the copy
+            finishes successfully; the resize output lands in the job log.
+            Volume targets only. Without --max, run that diskutil command
+            yourself after the clone.
+
+Safety (refused before start): same physical store, target smaller than
+source, target on the boot disk, device/file already used by a running
+job; file targets: existing file, insufficient free space, image path on
+a volume of the source container. Warns when source and target share one
+physical disk.
+
+Config: searched as \$MY_DD_CLONE_CONFIG, --config FILE,
+/LINKS/default/$SCRIPT_NAME.conf, ~/.$SCRIPT_NAME.conf, /etc, /usr/local/etc.
+Tunables: DD_BS (4m, plain dd only), STATE_DIR (job records + logs,
+/var/tmp/$SCRIPT_NAME), EMERGENCY_LOG_DIR (/var/log/my-dd-clone),
+DDRESCUE_RETRIES (3), EMERGENCY_BS (64k — the -E copy unit; deliberately
+small so a dying disk loses at most one small cluster per read error).
+
+Caveat: the clone is byte-identical — same APFS container/volume UUIDs as
+the source. Keep only one of the two attached.
+
+  -V, --verbose          echo each command before running it
+  -D, --debug            debug diagnostics (implies -V)
+  -E, --emergency        DYING-disk mode — for a failing source do NOT use
+                         plain dd, use -E: the most precise and fail-safe
+                         mode. GNU ddrescue replaces dd: it reads every good
+                         sector exactly ONCE, then trims/scrapes/retries only
+                         the bad areas over several passes (minimal stress on
+                         the failing disk), copies in small \$EMERGENCY_BS
+                         units, and records everything in a resumable
+                         mapfile — whereas plain dd would simply STOP at the
+                         first read error. Log + mapfile land under
+                         \$EMERGENCY_LOG_DIR (default /var/log/my-dd-clone,
+                         sudo-created if missing).
+                         Needs ddrescue: brew install ddrescue
+      --clear            with the status view: drop finished/failed job records
+      --config FILE      use FILE as config, bypassing the search
+      --create-config    print the default config to stdout
+      --create-config FILE
+                         write the default config to FILE (refuses to overwrite)
+  -h                     short usage only; --help = this full help
+EOF
+}
+
+die()  { printf '%s: ERROR: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 1; }
+warn() { printf '%s: WARNING: %s\n' "$SCRIPT_NAME" "$*" >&2; }
+dbg()  { if [ "$DBG" = 1 ]; then printf ' ~~~ %s\n' "$*"; fi; }
+note() { if [ "$VRB" = 1 ]; then printf '    > %s\n' "$*"; fi; }
+
+run() {
+  if [ "$VRB" = 1 ]; then printf ' >>> %s\n' "$*"; fi
+  "$@"
+}
+
+# kill -0 gets EPERM on the root-owned sudo'd dd, so liveness goes via ps
+_pid_alive() { ps -p "$1" > /dev/null 2>&1; }
+
+# mktemp files are registered here so an interrupt cannot leave them behind
+_TMPFILES=
+# shellcheck disable=SC2086  # word-splitting the space-separated list is intended
+_cleanup_tmp() { [ -n "$_TMPFILES" ] && command rm -f $_TMPFILES; }
+trap _cleanup_tmp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ---------------------------------------------------------------- config ----
+
+_default_config_content() {
+  cat <<'EOF'
+# my-dd-clone configuration (plain shell syntax, sourced at startup)
+
+# The TWO copy units — each mode uses exactly one of them:
+# DD_BS        plain dd clones (and --diff reads): big, for throughput on
+#              healthy disks.
+# EMERGENCY_BS -E / --emergency only (ddrescue cluster size): deliberately
+#              SMALL, so on a dying disk one read error loses at most this
+#              much and the bad-area map stays fine-grained.
+DD_BS="4m"
+EMERGENCY_BS="64k"
+
+# Directory holding job records and dd logs. Must survive the terminal
+# session (a reboot kills the dd anyway, so surviving reboots is not needed).
+STATE_DIR="/var/tmp/my-dd-clone"
+
+# -E / --emergency (dying-disk mode, uses GNU ddrescue):
+# where the ddrescue log and resume mapfile go (created via sudo and chown'd
+# to you if missing), and how many retry passes ddrescue makes over the bad
+# areas after the first careful full read.
+EMERGENCY_LOG_DIR="/var/log/my-dd-clone"
+DDRESCUE_RETRIES="3"
+EOF
+}
+
+create_config() {
+  # $1 = optional target file; empty = stdout
+  if [ -z "$1" ]; then
+    _default_config_content
+    return 0
+  fi
+  [ -e "$1" ] && die "refusing to overwrite existing file: $1"
+  _default_config_content > "$1" || die "cannot write $1"
+  printf '%s: wrote default config to %s\n' "$SCRIPT_NAME" "$1"
+}
+
+find_config() {
+  # sets _lc_file; returns 1 (silently) when no config exists
+  _lc_file=
+  if [ -n "${MY_DD_CLONE_CONFIG:-}" ]; then
+    _lc_file=$MY_DD_CLONE_CONFIG
+  elif [ -n "$CONFIG_OVERRIDE" ]; then
+    _lc_file=$CONFIG_OVERRIDE
+  else
+    for _lc_c in /LINKS/default/my-dd-clone.conf "$HOME/.my-dd-clone.conf" \
+                 /etc/my-dd-clone.conf /usr/local/etc/my-dd-clone.conf; do
+      if [ -f "$_lc_c" ]; then _lc_file=$_lc_c; break; fi
+    done
+  fi
+  [ -n "$_lc_file" ] && [ -f "$_lc_file" ]
+}
+
+load_config() {
+  if ! find_config; then
+    [ -n "${MY_DD_CLONE_CONFIG:-}" ] \
+      && die "\$MY_DD_CLONE_CONFIG points to a missing file: $MY_DD_CLONE_CONFIG"
+    [ -n "$CONFIG_OVERRIDE" ] && die "--config file not found: $CONFIG_OVERRIDE"
+    printf '%s: no config file found. Searched (in order):\n' "$SCRIPT_NAME" >&2
+    # shellcheck disable=SC2016  # the env-var NAME itself is the message here
+    for _lc_c in '$MY_DD_CLONE_CONFIG' '--config FILE' /LINKS/default/my-dd-clone.conf \
+                 "$HOME/.my-dd-clone.conf" /etc/my-dd-clone.conf /usr/local/etc/my-dd-clone.conf; do
+      printf '  %s\n' "$_lc_c" >&2
+    done
+    printf 'Create one with:  %s --create-config /LINKS/default/my-dd-clone.conf\n' "$SCRIPT_NAME" >&2
+    exit 1
+  fi
+  dbg "config file: $_lc_file"
+  # shellcheck disable=SC1090  # user config, path decided at runtime
+  . "$_lc_file"
+  [ -n "${DD_BS:-}" ]     || die "config $_lc_file does not set DD_BS"
+  [ -n "${STATE_DIR:-}" ] || die "config $_lc_file does not set STATE_DIR"
+}
+
+# ------------------------------------------------------------- resolving ----
+
+_human_bytes() {
+  awk -v b="$1" 'BEGIN { split("B KB MB GB TB PB", u, " "); i = 1
+    while (b >= 1000 && i < 6) { b /= 1000; i++ }
+    printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'
+}
+
+_fmt_elapsed() {
+  awk -v s="$1" 'BEGIN { h = int(s / 3600); m = int((s % 3600) / 60)
+    if (h > 0) printf "%dh%02dm", h, m
+    else if (m > 0) printf "%dm%02ds", m, s % 60
+    else printf "%ds", s }'
+}
+
+_bs_bytes() {
+  # "4m" -> 4194304 etc. (k/m/g suffixes, as dd understands them)
+  awk -v b="$1" 'BEGIN { n = b + 0; u = tolower(substr(b, length(b), 1))
+    if (u == "k") n *= 1024; else if (u == "m") n *= 1048576
+    else if (u == "g") n *= 1073741824
+    printf "%d", n }'
+}
+
+_diskutil_bytes() {
+  # $1 = device/volume; prints the exact byte size from diskutil info
+  diskutil info "$1" 2>/dev/null | awk '/Disk Size/ {
+    for (i = 1; i <= NF; i++) if ($i == "Bytes)") {
+      gsub(/\(/, "", $(i-1)); print $(i-1); exit } }'
+}
+
+resolve_volume() {
+  # $1 = NAME or /Volumes/NAME
+  # sets: _rv_name _rv_cont (synthesized container disk) _rv_phys (physical
+  #        store partition, e.g. disk4s2) _rv_bytes (physical store size)
+  _rv_arg=${1%/}
+  case $_rv_arg in
+    /Volumes/*) _rv_name=${_rv_arg#/Volumes/} ;;
+    /*)         die "SOURCE/TARGET must be /Volumes/<NAME> or <NAME>, got: $_rv_arg" ;;
+    *)          _rv_name=$_rv_arg ;;
+  esac
+  [ -n "$_rv_name" ] || die "empty volume name"
+
+  _rv_tmp=$(mktemp /tmp/my-dd-clone.info.XXXXXX) || die "mktemp failed"
+  _TMPFILES="$_TMPFILES $_rv_tmp"
+  if ! diskutil info "$_rv_name" > "$_rv_tmp" 2>&1 \
+     && ! diskutil info "/Volumes/$_rv_name" > "$_rv_tmp" 2>&1; then
+    command rm -f "$_rv_tmp"
+    die "diskutil does not know a volume named '$_rv_name'"
+  fi
+
+  # the label varies across macOS versions: "APFS Container:" vs "APFS Container Reference:"
+  _rv_cont=$(awk '/APFS Container/ { print $NF; exit }' "$_rv_tmp")
+  _rv_phys=$(awk '/APFS Physical Store/      { print $NF; exit }' "$_rv_tmp")
+  command rm -f "$_rv_tmp"
+
+  [ -n "$_rv_cont" ] || die "'$_rv_name' is not an APFS volume (no container reference)"
+  if [ -z "$_rv_phys" ]; then
+    _rv_phys=$(diskutil info "$_rv_cont" 2>/dev/null \
+               | awk '/Physical Store/ { print $NF; exit }')
+  fi
+  printf '%s\n' "$_rv_phys" | grep -Eq '^disk[0-9]+s[0-9]+$' \
+    || die "could not resolve the physical store of '$_rv_name' (got: '$_rv_phys')"
+
+  _rv_bytes=$(_diskutil_bytes "$_rv_phys")
+  printf '%s\n' "$_rv_bytes" | grep -Eq '^[0-9]+$' \
+    || die "could not determine the size of /dev/$_rv_phys"
+  dbg "$_rv_name: container=$_rv_cont physical-store=$_rv_phys bytes=$_rv_bytes"
+}
+
+# ---------------------------------------------------------------- status ----
+
+cmd_status() {
+  if [ ! -d "$STATE_DIR" ]; then
+    printf '%s: no clone jobs recorded (no %s)\n' "$SCRIPT_NAME" "$STATE_DIR"
+    return 0
+  fi
+  _st_any=0
+  for _st_jf in "$STATE_DIR"/job.*.env; do
+    [ -f "$_st_jf" ] || continue
+    _st_any=1
+    JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_SRC_DEV='' JOB_TGT_DEV='' JOB_SRC_BYTES=''
+    JOB_KIND='dd' JOB_MAP='' JOB_PID='' JOB_LOG='' JOB_EXITF='' JOB_ENDF=''
+    JOB_START_EPOCH='' JOB_OFFSET='0'
+    # shellcheck disable=SC1090  # our own job record, written by cmd_go below
+    . "$_st_jf"
+    _st_marker="${_st_jf%.env}.aborted"
+
+    _st_state=RUNNING
+    _st_exit=
+    if [ -f "$_st_marker" ]; then
+      _st_state=ABORTED
+    elif [ -f "$JOB_EXITF" ]; then
+      read -r _st_exit < "$JOB_EXITF" 2>/dev/null
+      case ${JOB_KIND}:${_st_exit} in
+        diff:0) _st_state="DONE (identical)" ;;
+        diff:1) _st_state="DONE (DIFFERS)" ;;
+        *:0)    _st_state=DONE ;;
+        *)      _st_state="FAILED(exit $_st_exit)" ;;
+      esac
+    elif ! _pid_alive "$JOB_PID"; then
+      _st_state="DIED(no exit code — killed or rebooted?)"
+    fi
+
+    _st_done=
+    _st_rate=
+    if [ "$JOB_KIND" = rescue ]; then
+      # ddrescue writes "rescued: 1234 MB" / "pct rescued: 12.34%" lines; the
+      # mapfile's current-position header is the fallback when the log has none
+      _st_resc=$(tr '\r' '\n' < "$JOB_LOG" 2>/dev/null \
+                 | sed -nE 's/.*[^t] rescued: *([^,]+),.*/\1/p' | tail -n 1)
+      _st_pctl=$(tr '\r' '\n' < "$JOB_LOG" 2>/dev/null \
+                 | sed -nE 's/.*pct rescued: *([0-9.]+%).*/\1/p' | tail -n 1)
+      if [ -z "$_st_resc" ] && [ -f "$JOB_MAP" ]; then
+        _st_pos=$(awk '!/^#/ { print $1; exit }' "$JOB_MAP")
+        _st_posdec=$(printf '%d' "$_st_pos" 2>/dev/null)
+        if printf '%s\n' "$_st_posdec" | grep -Eq '^[0-9]+$'; then
+          _st_done=$_st_posdec
+        fi
+      fi
+    else
+      # two dd progress formats exist: "N bytes transferred in S secs (R bytes/sec)"
+      # and the newer "N bytes (X MB, Y MiB) transferred S.SSSs, R MB/s"
+      _st_line=$(tr '\r' '\n' < "$JOB_LOG" 2>/dev/null | grep ' transferred' | tail -n 1)
+      _st_done=$(printf '%s\n' "$_st_line" | awk '{ print $1 }')
+      _st_rate=$(printf '%s\n' "$_st_line" | awk '
+        /bytes transferred in/ { gsub(/\(/, ""); print $7; exit }
+        NF >= 2 { u = $NF; r = $(NF-1) + 0
+          m = (u ~ /^kB/) ? 1e3 : (u ~ /^MB/) ? 1e6 : (u ~ /^GB/) ? 1e9 : 1
+          printf "%d", r * m; exit }')
+    fi
+
+    _st_prog=
+    if [ "$JOB_KIND" = rescue ] && [ -n "$_st_resc" ]; then
+      _st_prog="rescued $_st_resc of $(_human_bytes "$JOB_SRC_BYTES")${_st_pctl:+ ($_st_pctl)}"
+    fi
+    if printf '%s\n' "$_st_done" | grep -Eq '^[0-9]+$'; then
+      _st_done=$((JOB_OFFSET + _st_done))
+      _st_pct=$(awk -v d="$_st_done" -v t="$JOB_SRC_BYTES" \
+                'BEGIN { printf "%d", (t > 0) ? d * 100 / t : 0 }')
+      _st_prog="$(_human_bytes "$_st_done") of $(_human_bytes "$JOB_SRC_BYTES") (${_st_pct}%)"
+      if [ "$_st_state" = "RUNNING" ] \
+         && printf '%s\n' "$_st_rate" | grep -Eq '^[0-9]+$' && [ "$_st_rate" -gt 0 ]; then
+        _st_eta=$(awk -v d="$_st_done" -v t="$JOB_SRC_BYTES" -v r="$_st_rate" \
+                  'BEGIN { printf "%d", (t > d) ? (t - d) / r : 0 }')
+        _st_prog="$_st_prog  $(_human_bytes "$_st_rate")/s  ETA $(_fmt_elapsed "$_st_eta")"
+      fi
+    elif [ "$_st_state" = "RUNNING" ] && [ -z "$_st_prog" ]; then
+      _st_prog="no progress line yet in $JOB_LOG"
+    fi
+
+    _st_end=$(date +%s)
+    if [ -f "$JOB_ENDF" ]; then read -r _st_end < "$JOB_ENDF" 2>/dev/null; fi
+    _st_elapsed=$(_fmt_elapsed $(( _st_end - JOB_START_EPOCH )))
+    printf '%s  %s -> %s  pid %s  elapsed %s\n' \
+      "$_st_state" "$JOB_SRC_NAME" "$JOB_TGT_NAME" "$JOB_PID" "$_st_elapsed"
+    [ -n "$_st_prog" ] && printf '    > %s\n' "$_st_prog"
+    if [ "$_st_state" != "RUNNING" ]; then
+      # /usr/bin/time -p wrote real/user/sys into the log when the copy finished
+      _st_cpu=$(grep -E '^(real|user|sys) ' "$JOB_LOG" 2>/dev/null | tail -n 3 | tr '\n' ' ')
+      [ -n "$_st_cpu" ] && printf '    > time: %s(seconds)\n' "$_st_cpu"
+      if [ "$JOB_KIND" = diff ]; then
+        grep -E '^(RESULT:|src sha256|tgt sha256)' "$JOB_LOG" 2>/dev/null \
+          | while IFS= read -r _st_rl; do printf '    > %s\n' "$_st_rl"; done
+      fi
+    fi
+    printf '    > log: %s\n' "$JOB_LOG"
+    [ -n "$JOB_MAP" ] && printf '    > ddrescue mapfile: %s\n' "$JOB_MAP"
+
+    if [ "$CLEAR" = 1 ] && [ "$_st_state" != "RUNNING" ]; then
+      command rm -f "$_st_jf" "$JOB_LOG" "$JOB_EXITF" "$_st_marker"
+      [ -n "$JOB_ENDF" ] && command rm -f "$JOB_ENDF"
+      [ -n "$JOB_MAP" ] && command rm -f "$JOB_MAP"
+      printf '    > cleared\n'
+    fi
+  done
+  if [ "$_st_any" = 0 ]; then
+    printf '%s: no clone jobs recorded in %s\n' "$SCRIPT_NAME" "$STATE_DIR"
+  fi
+}
+
+_have_jobs() {
+  [ -d "$STATE_DIR" ] || return 1
+  for _hj_f in "$STATE_DIR"/job.*.env; do
+    [ -f "$_hj_f" ] && return 0
+  done
+  return 1
+}
+
+_sel_norm() {
+  # normalize a selector or recorded name: drop /Volumes/ prefix + trailing /
+  _sn=${1%/}
+  printf '%s' "${_sn#/Volumes/}"
+}
+
+cmd_abort() {
+  # $1 = optional selector: pid or SOURCE volume; $2 = optional TARGET
+  # (both empty = every running clone). Analyze-by-default like everything
+  # else: without 'go' it only lists what WOULD be aborted.
+  _ab_sel=$(_sel_norm "${1:-}")
+  _ab_selt=$(_sel_norm "${2:-}")
+  _ab_running=0
+  _ab_matches=0
+  _ab_matchlist=
+  _have_jobs || die "no clone jobs recorded in ${STATE_DIR:-?}"
+  for _ab_jf in "$STATE_DIR"/job.*.env; do
+    [ -f "$_ab_jf" ] || continue
+    JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_PID='' JOB_EXITF=''
+    # shellcheck disable=SC1090  # our own job record
+    . "$_ab_jf"
+    [ -f "$JOB_EXITF" ] && continue
+    _pid_alive "$JOB_PID" || continue
+    _ab_running=$((_ab_running + 1))
+    _ab_list="${_ab_list:-}  pid $JOB_PID  $JOB_SRC_NAME -> $JOB_TGT_NAME
+"
+    _ab_jsrc=$(_sel_norm "$JOB_SRC_NAME")
+    _ab_jtgt=$(_sel_norm "$JOB_TGT_NAME")
+    if [ -z "$_ab_sel" ] || [ "$_ab_sel" = "$JOB_PID" ] || [ "$_ab_sel" = "$_ab_jsrc" ]; then
+      if [ -z "$_ab_selt" ] || [ "$_ab_selt" = "$_ab_jtgt" ]; then
+        _ab_matches=$((_ab_matches + 1))
+        _ab_matchlist="$_ab_matchlist $_ab_jf"
+      fi
+    fi
+  done
+  [ "$_ab_running" -gt 0 ] || die "no clone is running — nothing to abort"
+  [ "$_ab_matches" -gt 0 ] || die "no running clone matches '$_ab_sel${_ab_selt:+ -> $_ab_selt}' (running:
+$_ab_list)"
+
+  if [ "$GO" = 0 ]; then
+    printf '%s: ANALYZE only — append '\''go'\'' to do it. Would abort %d clone(s):\n' \
+      "$SCRIPT_NAME" "$_ab_matches"
+    for _ab_jf in $_ab_matchlist; do
+      JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_PID=''
+      # shellcheck disable=SC1090  # our own job record
+      . "$_ab_jf"
+      printf '  pid %s  %s -> %s\n' "$JOB_PID" "$JOB_SRC_NAME" "$JOB_TGT_NAME"
+    done
+    return 0
+  fi
+
+  _ab_sudo=0
+  if [ "$(id -u)" -ne 0 ]; then
+    _ab_sudo=1
+    note "the clones run as root; sudo is needed to signal them"
+    sudo -v || die "sudo authentication failed"
+  fi
+  for _ab_jf in $_ab_matchlist; do
+    JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_SRC_DEV='' JOB_KIND='dd' JOB_MAP='' JOB_PID='' JOB_EXITF=''
+    # shellcheck disable=SC1090  # our own job record
+    . "$_ab_jf"
+    # kill the copy process itself (matched by its unique source device); the
+    # wrapper then finishes its own bookkeeping (exit code + end timestamp),
+    # so nothing races. The wrapper is only signalled if it lingers.
+    if [ "$_ab_sudo" = 1 ]; then
+      run sudo pkill -TERM -f "/dev/r$JOB_SRC_DEV" 2>/dev/null
+      sleep 2
+      _pid_alive "$JOB_PID" && run sudo kill -TERM "$JOB_PID" 2>/dev/null
+    else
+      run pkill -TERM -f "/dev/r$JOB_SRC_DEV" 2>/dev/null
+      sleep 2
+      _pid_alive "$JOB_PID" && run kill -TERM "$JOB_PID" 2>/dev/null
+    fi
+    : > "${_ab_jf%.env}.aborted"
+    printf '%s: aborted %s -> %s  (pid %s)\n' "$SCRIPT_NAME" "$JOB_SRC_NAME" "$JOB_TGT_NAME" "$JOB_PID"
+    if [ "$JOB_KIND" != diff ]; then
+      printf '    > the target holds a PARTIAL copy — do not use it as-is\n'
+      printf '    > resume: rerun the same %s%s -> %s clone with '\''go'\'' — it will offer to RESUME\n' \
+        "$([ "$JOB_KIND" = rescue ] && printf '%s' '-E ')" "$JOB_SRC_NAME" "$JOB_TGT_NAME"
+    fi
+    [ "$JOB_KIND" = rescue ] && printf '    > mapfile kept: %s\n' "$JOB_MAP"
+  done
+}
+
+# --------------------------------------------------------- analyze / go -----
+
+preflight_file() {
+  # uses: SRC_* TGT_FILE globals set by main; dies on hard errors
+  case $TGT_FILE in
+    *\'*) die "target image path must not contain a single quote: $TGT_FILE" ;;
+  esac
+  if [ -e "$TGT_FILE" ]; then
+    if [ "$HAVE_RESUME" = 1 ]; then
+      note "target image exists and matches an unfinished run — 'go' will offer to resume"
+    else
+      die "target image already exists: $TGT_FILE (remove it first)"
+    fi
+  fi
+  _pf_dir=$(dirname "$TGT_FILE")
+  [ -d "$_pf_dir" ] || die "directory of the target image does not exist: $_pf_dir"
+  [ -w "$_pf_dir" ] || die "directory of the target image is not writable: $_pf_dir"
+
+  _pf_needed=$SRC_BYTES
+  [ "$HAVE_RESUME" = 1 ] && _pf_needed=$((SRC_BYTES - RESUME_DONE))
+  _pf_avail=$(df -Pk "$_pf_dir" | awk 'NR == 2 { printf "%.0f", $4 * 1024 }')
+  printf '%s\n' "$_pf_avail" | grep -Eq '^[0-9]+$' \
+    || die "could not determine the free space in $_pf_dir"
+  [ "$_pf_avail" -ge "$_pf_needed" ] \
+    || die "not enough free space in $_pf_dir ($(_human_bytes "$_pf_avail") free, the image needs $(_human_bytes "$_pf_needed"))"
+  TGT_AVAIL=$_pf_avail
+
+  _pf_fsdev=$(df -P "$_pf_dir" | awk 'NR == 2 { print $1 }')
+  _pf_fsdev=${_pf_fsdev#/dev/}
+  if [ "${_pf_fsdev%s*}" = "$SRC_CONT" ]; then
+    die "the target image lies on a volume of the SOURCE container ($SRC_CONT), which 'go' unmounts — pick another destination"
+  fi
+}
+
+preflight_emergency() {
+  DDRESCUE_BIN=$(command -v ddrescue 2>/dev/null)
+  [ -n "$DDRESCUE_BIN" ] || DDRESCUE_BIN=/opt/homebrew/bin/ddrescue
+  [ -x "$DDRESCUE_BIN" ] \
+    || die "-E needs GNU ddrescue, which was not found — install it with: brew install ddrescue"
+  if [ -z "${EMERGENCY_LOG_DIR:-}" ] || [ -z "${DDRESCUE_RETRIES:-}" ] || [ -z "${EMERGENCY_BS:-}" ]; then
+    die "config lacks EMERGENCY_LOG_DIR / DDRESCUE_RETRIES / EMERGENCY_BS — add them or regenerate with --create-config"
+  fi
+  EMERGENCY_SECTORS=$(( $(_bs_bytes "$EMERGENCY_BS") / 512 ))
+  [ "$EMERGENCY_SECTORS" -ge 1 ] || die "EMERGENCY_BS is smaller than one 512-byte sector: $EMERGENCY_BS"
+  if [ ! -d "$EMERGENCY_LOG_DIR" ] || [ ! -w "$EMERGENCY_LOG_DIR" ]; then
+    note "$EMERGENCY_LOG_DIR is missing or not writable — 'go' creates it via sudo and chowns it to you"
+  fi
+}
+
+preflight_diff() {
+  # --diff only reads both sides, so the write-oriented checks do not apply
+  if [ "$TGT_MODE" = file ]; then
+    case $TGT_FILE in
+      *\'*) die "image path must not contain a single quote: $TGT_FILE" ;;
+    esac
+    [ -f "$TGT_FILE" ] || die "--diff needs an existing image file: $TGT_FILE"
+    # shellcheck disable=SC2012  # ls -ln for the size only; awk field 5 is robust here
+    TGT_BYTES=$(ls -ln "$TGT_FILE" | awk '{ print $5 }')
+    [ "$TGT_BYTES" -ge "$SRC_BYTES" ] \
+      || die "image is smaller than the source ($(_human_bytes "$TGT_BYTES") < $(_human_bytes "$SRC_BYTES")) — they cannot be identical"
+    _pd_fsdev=$(df -P "$(dirname "$TGT_FILE")" | awk 'NR == 2 { print $1 }')
+    _pd_fsdev=${_pd_fsdev#/dev/}
+    if [ "${_pd_fsdev%s*}" = "$SRC_CONT" ]; then
+      die "the image lies on a volume of the SOURCE container ($SRC_CONT), which 'go' unmounts — copy it elsewhere first"
+    fi
+  else
+    [ "$SRC_PHYS" != "$TGT_PHYS" ] \
+      || die "source and target are the same physical store — nothing to compare"
+    [ "$TGT_BYTES" -ge "$SRC_BYTES" ] \
+      || die "target is smaller than the source ($(_human_bytes "$TGT_BYTES") < $(_human_bytes "$SRC_BYTES")) — they cannot be identical"
+  fi
+  if [ "$TGT_BYTES" -gt "$SRC_BYTES" ]; then
+    warn "target is larger than the source; only the first $(_human_bytes "$SRC_BYTES") are compared"
+  fi
+}
+
+verify_devices_with_diskutil() {
+  # safety net: cross-check the chosen devices against a fresh 'diskutil list'
+  _vd_tmp=$(mktemp /tmp/my-dd-clone.dul.XXXXXX) || die "mktemp failed"
+  _TMPFILES="$_TMPFILES $_vd_tmp"
+  diskutil list > "$_vd_tmp" 2>&1 || die "safety net: 'diskutil list' failed"
+
+  # each device must appear as an Apple_APFS store AND its listed SIZE must
+  # correspond to what it resolved to
+  _vd_check() { # $1 = device  $2 = expected bytes  $3 = label
+    _vd_line=$(grep -E "Apple_APFS.*[[:space:]]$1\$" "$_vd_tmp" | tail -n 1)
+    [ -n "$_vd_line" ] \
+      || die "safety net: /dev/$1 is not an Apple_APFS store in 'diskutil list' — topology changed, re-run"
+    _vd_size=$(printf '%s\n' "$_vd_line" | awk '{ print $(NF-2), $(NF-1) }')
+    _vd_want=$(_human_bytes "$2")
+    [ "$_vd_size" = "$_vd_want" ] \
+      || die "safety net: $3 /dev/$1 is $_vd_size in 'diskutil list' but resolved as $_vd_want — SIZE MISMATCH, re-check with 'diskutil list'"
+  }
+  _vd_check "$SRC_PHYS" "$SRC_BYTES" SOURCE
+  [ -n "$TGT_PHYS" ] && _vd_check "$TGT_PHYS" "$TGT_BYTES" TARGET
+  if [ -n "$SRC_CONT" ]; then
+    awk -v sec="/dev/$SRC_CONT " -v dev="$SRC_PHYS" '
+      index($0, sec) == 1 { insec = 1; next }
+      /^\/dev\// { insec = 0 }
+      insec && /Physical Store/ && index($0, dev) { ok = 1 }
+      END { exit ok ? 0 : 1 }' "$_vd_tmp" \
+      || die "safety net: container $SRC_CONT does not list $SRC_PHYS as its physical store — topology changed, re-run"
+  fi
+  _vd_dup=$(grep -Fc "APFS Volume $SRC_NAME " "$_vd_tmp")
+  if [ "$_vd_dup" -gt 1 ]; then
+    warn "safety net: $_vd_dup volumes named '$SRC_NAME' exist right now (partial-clone twin):"
+    grep -F "APFS Volume $SRC_NAME " "$_vd_tmp" >&2
+  fi
+  note "safety net: devices cross-checked against 'diskutil list'"
+  command rm -f "$_vd_tmp"
+}
+
+recover_target_device() {
+  # sets TGT_NAME/TGT_PHYS/TGT_BYTES (TGT_CONT if still known) from the
+  # newest unfinished job whose target name matches $TGT_ARG; returns 1 if none
+  _rd_want=$(_sel_norm "$TGT_ARG")
+  _rd_dev=
+  [ -d "$STATE_DIR" ] || return 1
+  for _rd_jf in "$STATE_DIR"/job.*.env; do
+    [ -f "$_rd_jf" ] || continue
+    JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_TGT_DEV='' JOB_PID='' JOB_EXITF=''
+    # shellcheck disable=SC1090  # our own job record
+    . "$_rd_jf"
+    [ "$(_sel_norm "$JOB_TGT_NAME")" = "$_rd_want" ] || continue
+    [ "$(_sel_norm "$JOB_SRC_NAME")" = "$(_sel_norm "$SRC_NAME")" ] || continue
+    if [ -f "$JOB_EXITF" ]; then
+      read -r _rd_e < "$JOB_EXITF" 2>/dev/null
+      [ "$_rd_e" = "0" ] && continue
+    elif _pid_alive "$JOB_PID"; then
+      continue
+    fi
+    printf '%s\n' "$JOB_TGT_DEV" | grep -Eq '^disk[0-9]+s[0-9]+$' || continue
+    _rd_dev=$JOB_TGT_DEV
+  done
+  [ -n "$_rd_dev" ] || return 1
+  TGT_BYTES=$(_diskutil_bytes "$_rd_dev")
+  printf '%s\n' "$TGT_BYTES" | grep -Eq '^[0-9]+$' || return 1
+  TGT_PHYS=$_rd_dev
+  TGT_CONT=$(diskutil info "$_rd_dev" 2>/dev/null | awk '/APFS Container/ { print $NF; exit }')
+  TGT_NAME=$_rd_want
+  warn "volume '$TGT_ARG' no longer resolves (a partial clone overwrote it) — using its recorded device /dev/$TGT_PHYS"
+  return 0
+}
+
+find_resume_candidate() {
+  # newest unfinished job matching SOURCE, TARGET and engine;
+  # sets RESUME_DONE (bytes already copied) / RESUME_MAP; returns 1 if none
+  RESUME_DONE=0
+  RESUME_MAP=
+  RESUME_SRC_DEV=
+  RESUME_TGT_DEV=
+  RESUME_SRC_BYTES=
+  _fr_found=0
+  _fr_kind='dd'
+  [ "$EMERGENCY" = 1 ] && _fr_kind=rescue
+  [ -d "$STATE_DIR" ] || return 1
+  for _fr_jf in "$STATE_DIR"/job.*.env; do
+    [ -f "$_fr_jf" ] || continue
+    JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_SRC_DEV='' JOB_TGT_DEV='' JOB_SRC_BYTES=''
+    JOB_KIND='dd' JOB_MAP='' JOB_PID='' JOB_LOG='' JOB_EXITF='' JOB_OFFSET='0'
+    # shellcheck disable=SC1090  # our own job record
+    . "$_fr_jf"
+    [ "$(_sel_norm "$JOB_SRC_NAME")" = "$(_sel_norm "$SRC_NAME")" ] || continue
+    [ "$(_sel_norm "$JOB_TGT_NAME")" = "$(_sel_norm "$TGT_NAME")" ] || continue
+    [ "$JOB_KIND" = "$_fr_kind" ] || continue
+    if [ -f "$JOB_EXITF" ]; then
+      read -r _fr_exit < "$JOB_EXITF" 2>/dev/null
+      [ "$_fr_exit" = "0" ] && continue      # finished fine — nothing to resume
+    elif _pid_alive "$JOB_PID"; then
+      continue                               # still running — the conflict check owns this
+    fi
+    if [ "$_fr_kind" = rescue ]; then
+      [ -f "$JOB_MAP" ] || continue          # no mapfile, no resume
+      _fr_found=1 RESUME_MAP=$JOB_MAP
+    else
+      _fr_done=$(tr '\r' '\n' < "$JOB_LOG" 2>/dev/null \
+                 | grep ' transferred' | tail -n 1 | awk '{ print $1 }')
+      printf '%s\n' "$_fr_done" | grep -Eq '^[0-9]+$' || continue
+      _fr_done=$((JOB_OFFSET + _fr_done))
+      [ "$_fr_done" -gt 0 ] || continue
+      _fr_found=1 RESUME_DONE=$_fr_done      # job ids sort by time — last match is newest
+    fi
+    RESUME_SRC_DEV=$JOB_SRC_DEV
+    RESUME_TGT_DEV=$JOB_TGT_DEV
+    RESUME_SRC_BYTES=$JOB_SRC_BYTES
+  done
+  [ "$_fr_found" = 1 ]
+}
+
+preflight_volume() {
+  # uses: SRC_* TGT_* globals set by main; dies on hard errors, warns otherwise
+  [ "$SRC_PHYS" != "$TGT_PHYS" ] \
+    || die "source and target resolve to the same physical store /dev/$SRC_PHYS"
+  [ "$TGT_BYTES" -ge "$SRC_BYTES" ] \
+    || die "target physical store is smaller than the source ($(_human_bytes "$TGT_BYTES") < $(_human_bytes "$SRC_BYTES")) — dd would truncate"
+
+  _pf_boot=$(diskutil info / 2>/dev/null | awk '/APFS Physical Store/ { print $NF; exit }')
+  if [ -n "$_pf_boot" ] && [ "${TGT_PHYS%s*}" = "${_pf_boot%s*}" ]; then
+    die "target /dev/$TGT_PHYS lives on the BOOT disk (${_pf_boot%s*}) — refusing"
+  fi
+  if [ "${SRC_PHYS%s*}" = "${TGT_PHYS%s*}" ]; then
+    warn "source and target are partitions of the SAME physical disk (${SRC_PHYS%s*})"
+  fi
+  if [ "$TGT_BYTES" -gt "$SRC_BYTES" ] && [ "$MAX" = 0 ] && [ "$DIFF" = 0 ]; then
+    warn "target is larger than the source: please check out --max !"
+  fi
+}
+
+check_no_conflicting_job() {
+  [ -d "$STATE_DIR" ] || return 0
+  for _cj_jf in "$STATE_DIR"/job.*.env; do
+    [ -f "$_cj_jf" ] || continue
+    JOB_SRC_DEV='' JOB_TGT_DEV='' JOB_PID='' JOB_EXITF=''
+    # shellcheck disable=SC1090  # our own job record
+    . "$_cj_jf"
+    [ -f "$JOB_EXITF" ] && continue
+    _pid_alive "$JOB_PID" || continue
+    for _cj_dev in "$JOB_SRC_DEV" "$JOB_TGT_DEV"; do
+      if [ "$_cj_dev" = "$SRC_PHYS" ] || { [ -n "$TGT_PHYS" ] && [ "$_cj_dev" = "$TGT_PHYS" ]; } \
+         || { [ -n "$TGT_FILE" ] && [ "$_cj_dev" = "$TGT_FILE" ]; }; then
+        die "a running clone (pid $JOB_PID, record $_cj_jf) already uses $_cj_dev"
+      fi
+    done
+  done
+}
+
+print_analysis() {
+  printf '%s: ANALYZE only — append '\''go'\'' to do it (see below).\n\n' "$SCRIPT_NAME"
+  printf ' SOURCE  %-24s container %-7s physical store /dev/r%-10s %s (%s bytes)\n' \
+    "$SRC_NAME" "$SRC_CONT" "$SRC_PHYS" "$(_human_bytes "$SRC_BYTES")" "$SRC_BYTES"
+  if [ "$DIFF" = 1 ]; then
+    if [ "$TGT_MODE" = file ]; then
+      printf ' TARGET  %s  (existing image, %s)\n' "$TGT_FILE" "$(_human_bytes "$TGT_BYTES")"
+    else
+      printf ' TARGET  %-24s container %-7s physical store /dev/r%-10s %s (%s bytes)\n' \
+        "$TGT_NAME" "$TGT_CONT" "$TGT_PHYS" "$(_human_bytes "$TGT_BYTES")" "$TGT_BYTES"
+    fi
+    cat <<EOF
+
+ 'go' will (--diff — nothing is written to either side):
+   - unmount the container(s) so both sides are read consistently
+   - sha256 the first $(_human_bytes "$SRC_BYTES") of each side, reading each exactly once
+   - run detached via nohup; the verdict (IDENTICAL/DIFFER) lands in the status view
+EOF
+    return 0
+  fi
+  if [ "$TGT_MODE" = file ]; then
+    printf ' TARGET  %s\n         raw image file, will be created (%s needed, %s free at destination)\n' \
+      "$TGT_FILE" "$(_human_bytes "$SRC_BYTES")" "$(_human_bytes "$TGT_AVAIL")"
+    cat <<EOF
+
+ 'go' will:
+   - unmount every volume in the source container (diskutil unmountDisk $SRC_CONT)
+   - write the raw content of /dev/r$SRC_PHYS into $TGT_FILE
+   - run dd detached via nohup (bs=$DD_BS) — it survives closing this terminal
+   - progress afterwards: run '$SCRIPT_NAME' with no arguments
+EOF
+  else
+    printf ' TARGET  %-24s container %-7s physical store /dev/r%-10s %s (%s bytes)\n' \
+      "$TGT_NAME" "$TGT_CONT" "$TGT_PHYS" "$(_human_bytes "$TGT_BYTES")" "$TGT_BYTES"
+    cat <<EOF
+
+ 'go' will:
+   - unmount every volume in both containers (diskutil unmountDisk $SRC_CONT / $TGT_CONT)
+   - OVERWRITE the entire target physical store /dev/r$TGT_PHYS — ALL data in
+     container $TGT_CONT (volume '$TGT_NAME' and any sibling volumes) is DESTROYED
+   - run dd detached via nohup (bs=$DD_BS) — it survives closing this terminal
+   - progress afterwards: run '$SCRIPT_NAME' with no arguments
+EOF
+    if [ "$MAX" = 1 ]; then
+      printf '   - after a SUCCESSFUL copy (--max): diskutil apfs resizeContainer %s 0\n     grows the copied container to fill the whole partition\n' "$TGT_PHYS"
+    fi
+  fi
+  if [ "$EMERGENCY" = 0 ]; then
+    cat <<EOF
+
+ NOTE: if the SOURCE disk is DYING (read errors, SMART warnings, clicking)
+ --> please check out --emergency !!
+EOF
+  fi
+  if [ "$EMERGENCY" = 1 ]; then
+    cat <<EOF
+
+ emergency mode (-E): GNU ddrescue replaces dd. Good sectors are read exactly
+ once; only bad areas get trim/scrape plus $DDRESCUE_RETRIES retry passes — the
+ gentlest possible treatment of a dying source disk. The bs=$DD_BS above does
+ NOT apply: -E deliberately copies in small $EMERGENCY_BS units, so one read
+ error loses at most that much. Log and resume mapfile land under $EMERGENCY_LOG_DIR/.
+EOF
+  fi
+  if [ "$HAVE_RESUME" = 1 ]; then
+    if [ "$EMERGENCY" = 1 ]; then
+      printf "\n an UNFINISHED previous rescue of this pair exists — 'go' will offer to RESUME it from its mapfile.\n"
+    else
+      printf "\n an UNFINISHED previous clone of this pair exists (~%s copied) — 'go' will offer to RESUME it.\n" \
+        "$(_human_bytes "$RESUME_DONE")"
+    fi
+  fi
+}
+
+cmd_go() {
+  check_no_conflicting_job
+  mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
+
+  # unfinished previous run of this exact SOURCE -> TARGET -> offer to resume.
+  # Only the literal answers 'resume' / 'new' proceed; anything else stops.
+  _go_resume=0
+  if [ "$HAVE_RESUME" = 1 ] && [ "$RESUME_FLAG" = 1 ]; then
+    _go_resume=1
+  elif [ "$HAVE_RESUME" = 1 ]; then
+    if [ "$DIFF" = 0 ] && [ -t 0 ]; then
+      if [ "$EMERGENCY" = 1 ]; then
+        printf '%s: found an UNFINISHED previous rescue of %s -> %s (mapfile: %s)\n' \
+          "$SCRIPT_NAME" "$SRC_NAME" "$TGT_NAME" "$RESUME_MAP"
+      else
+        printf '%s: found an UNFINISHED previous clone of %s -> %s (~%s already copied)\n' \
+          "$SCRIPT_NAME" "$SRC_NAME" "$TGT_NAME" "$(_human_bytes "$RESUME_DONE")"
+      fi
+      printf "type 'resume' to continue it, or 'new' to start from scratch: "
+      read -r _go_ans
+      case $_go_ans in
+        resume) _go_resume=1 ;;
+        new)    _go_resume=0 ;;
+        *)      die "answer was neither 'resume' nor 'new' — nothing was started" ;;
+      esac
+    elif [ "$DIFF" = 0 ]; then
+      die "an unfinished previous run of this clone exists — rerun in a terminal to choose, pass --resume to continue it, or --clear the old record"
+    fi
+  fi
+
+  _go_sudo=0
+  if [ "$(id -u)" -ne 0 ]; then
+    _go_sudo=1
+    note "raw devices need root; validating sudo now so the detached run never has to prompt"
+    sudo -v || die "sudo authentication failed"
+  fi
+
+  if [ "$EMERGENCY" = 1 ] && { [ ! -d "$EMERGENCY_LOG_DIR" ] || [ ! -w "$EMERGENCY_LOG_DIR" ]; }; then
+    if [ "$_go_sudo" = 1 ]; then
+      if ! run sudo mkdir -p "$EMERGENCY_LOG_DIR" \
+         || ! run sudo chown "$(id -u):$(id -g)" "$EMERGENCY_LOG_DIR"; then
+        die "cannot create/own $EMERGENCY_LOG_DIR"
+      fi
+      note "created $EMERGENCY_LOG_DIR (via sudo) and chown'd it to you"
+    else
+      run mkdir -p "$EMERGENCY_LOG_DIR" || die "cannot create $EMERGENCY_LOG_DIR"
+    fi
+  fi
+
+  run diskutil unmountDisk "$SRC_CONT" \
+    || die "could not unmount the source container $SRC_CONT"
+  note "all volumes in the source container are now unmounted (consistent read)"
+  if [ "$TGT_MODE" != file ]; then
+    if [ -n "$TGT_CONT" ]; then
+      run diskutil unmountDisk "$TGT_CONT" \
+        || die "could not unmount the target container $TGT_CONT"
+      note "all volumes in the target container are now unmounted (nothing holds the device open)"
+    else
+      note "target container unknown (recovered device) — nothing mounted to unmount"
+    fi
+  fi
+
+  _go_id=$(date +%Y%m%d-%H%M%S).$$
+  _go_map=
+  if [ "$EMERGENCY" = 1 ]; then
+    _go_log=$EMERGENCY_LOG_DIR/my-dd-clone.emergency.$_go_id.log
+    _go_map=$EMERGENCY_LOG_DIR/my-dd-clone.emergency.$_go_id.map
+    [ "$_go_resume" = 1 ] && _go_map=$RESUME_MAP
+  else
+    _go_log=$STATE_DIR/job.$_go_id.log
+  fi
+  _go_exitf=$STATE_DIR/job.$_go_id.exit
+  _go_endf=$STATE_DIR/job.$_go_id.end
+  _go_jobf=$STATE_DIR/job.$_go_id.env
+  : > "$_go_log" || die "cannot write $_go_log"
+
+  if [ "$TGT_MODE" = file ]; then
+    _go_of="'$TGT_FILE'" _go_tdev=$TGT_FILE
+  else
+    _go_of=/dev/r$TGT_PHYS _go_tdev=$TGT_PHYS
+  fi
+
+  # resume of a plain dd: skip/seek in whole blocks, rewound 16 blocks so the
+  # possibly-unflushed tail of the aborted run is rewritten rather than trusted
+  _go_offset=0
+  _go_skipseek=
+  if [ "$_go_resume" = 1 ] && [ "$EMERGENCY" = 0 ]; then
+    _go_bsb=$(_bs_bytes "$DD_BS")
+    _go_blk=$((RESUME_DONE / _go_bsb))
+    if [ "$_go_blk" -gt 16 ]; then _go_blk=$((_go_blk - 16)); else _go_blk=0; fi
+    _go_offset=$((_go_blk * _go_bsb))
+    _go_skipseek="skip=$_go_blk seek=$_go_blk "
+  fi
+  if [ "$_go_resume" = 0 ] && [ "$DIFF" = 0 ] && [ "$TGT_MODE" = file ] && [ -e "$TGT_FILE" ]; then
+    command rm -f "$TGT_FILE" || die "cannot remove the old target image $TGT_FILE"
+  fi
+
+  if [ "$DIFF" = 1 ]; then
+    _go_kind='diff'
+    _go_body="_s=\$(dd if=/dev/r$SRC_PHYS bs=$DD_BS status=progress | shasum -a 256 | awk '{print \$1}'); echo \"src sha256 \$_s\"; _t=\$(head -c $SRC_BYTES $_go_of | shasum -a 256 | awk '{print \$1}'); echo \"tgt sha256 \$_t\"; if [ \"\$_s\" = \"\$_t\" ]; then echo 'RESULT: IDENTICAL'; true; else echo 'RESULT: DIFFER'; false; fi"
+  elif [ "$EMERGENCY" = 1 ]; then
+    _go_kind=rescue
+    _go_body="/usr/bin/time -p '$DDRESCUE_BIN' -f -c $EMERGENCY_SECTORS -r $DDRESCUE_RETRIES /dev/r$SRC_PHYS $_go_of '$_go_map'"
+  else
+    _go_kind='dd'
+    _go_body="/usr/bin/time -p dd if=/dev/r$SRC_PHYS of=$_go_of bs=$DD_BS ${_go_skipseek}status=progress"
+  fi
+  _go_chown_cmd=
+  if [ "$_go_sudo" = 1 ] && [ "$DIFF" = 0 ]; then
+    _go_chown=
+    [ "$TGT_MODE" = file ] && _go_chown="'$TGT_FILE'"
+    [ -n "$_go_map" ] && _go_chown="$_go_chown '$_go_map'"
+    [ -n "$_go_chown" ] && _go_chown_cmd="chown $(id -u):$(id -g) $_go_chown; "
+  fi
+  _go_max_cmd=
+  if [ "$MAX" = 1 ]; then
+    _go_max_cmd="if [ \$_rc -eq 0 ]; then echo 'MAX: growing the APFS container to fill the partition'; diskutil apfs resizeContainer $TGT_PHYS 0; fi; "
+  fi
+  # the wrapper's trap records exit code + end time even when it is TERMinated
+  _go_cmd="trap \"echo 143 > '$_go_exitf'; date +%s > '$_go_endf'\" TERM INT; $_go_body; _rc=\$?; ${_go_max_cmd}${_go_chown_cmd}echo \$_rc > '$_go_exitf'; date +%s > '$_go_endf'"
+  if [ "$VRB" = 1 ]; then
+    if [ "$_go_sudo" = 1 ]; then printf ' >>> nohup sudo -n sh -c "%s" &\n' "$_go_cmd"
+    else printf ' >>> nohup sh -c "%s" &\n' "$_go_cmd"; fi
+    note "nohup + detach: the copy keeps running after this terminal closes"
+    note "progress goes to $_go_log; the exit code lands in $_go_exitf"
+  fi
+  if [ "$_go_sudo" = 1 ]; then
+    nohup sudo -n sh -c "$_go_cmd" < /dev/null >> "$_go_log" 2>&1 &
+  else
+    nohup sh -c "$_go_cmd" < /dev/null >> "$_go_log" 2>&1 &
+  fi
+  _go_pid=$!
+
+  cat > "$_go_jobf" <<EOF
+JOB_SRC_NAME='$SRC_NAME'
+JOB_TGT_NAME='$TGT_NAME'
+JOB_SRC_DEV='$SRC_PHYS'
+JOB_TGT_DEV='$_go_tdev'
+JOB_SRC_BYTES='$SRC_BYTES'
+JOB_KIND='$_go_kind'
+JOB_MAP='$_go_map'
+JOB_OFFSET='$_go_offset'
+JOB_PID='$_go_pid'
+JOB_LOG='$_go_log'
+JOB_EXITF='$_go_exitf'
+JOB_ENDF='$_go_endf'
+JOB_START_EPOCH='$(date +%s)'
+EOF
+
+  printf '%s: started %s -> %s  (pid %s, detached — safe to close this terminal)\n' \
+    "$SCRIPT_NAME" "$SRC_NAME" "$TGT_NAME" "$_go_pid"
+  if [ "$DIFF" = 1 ]; then
+    printf '    > comparing /dev/r%s with %s, %s each side\n' \
+      "$SRC_PHYS" "$TGT_NAME" "$(_human_bytes "$SRC_BYTES")"
+  elif [ "$TGT_MODE" = file ]; then
+    printf '    > imaging /dev/r%s into %s, %s\n' \
+      "$SRC_PHYS" "$TGT_FILE" "$(_human_bytes "$SRC_BYTES")"
+  else
+    printf '    > cloning /dev/r%s onto /dev/r%s, %s\n' \
+      "$SRC_PHYS" "$TGT_PHYS" "$(_human_bytes "$SRC_BYTES")"
+  fi
+  [ "$MAX" = 1 ] \
+    && printf '    > --max: after a successful copy, the container is grown to fill /dev/%s\n' "$TGT_PHYS"
+  [ "$_go_resume" = 1 ] && [ "$_go_offset" -gt 0 ] \
+    && printf '    > resuming at %s (16 blocks rewound for safety)\n' "$(_human_bytes "$_go_offset")"
+  [ "$_go_resume" = 1 ] && [ "$EMERGENCY" = 1 ] \
+    && printf '    > resuming from mapfile %s — only unread/bad areas are touched\n' "$_go_map"
+  printf '    > log: %s\n' "$_go_log"
+  [ -n "$_go_map" ] && printf '    > ddrescue mapfile (resume state): %s\n' "$_go_map"
+  printf '    > check progress with: %s\n' "$SCRIPT_NAME"
+}
+
+# ------------------------------------------------------------------ main ----
+
+SRC_ARG=
+TGT_ARG=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h) usage_short; exit 0 ;;
+    --help) usage; exit 0 ;;
+    -V|--verbose) VRB=1 ;;
+    -D|--debug) DBG=1 ;;
+    -E|--emergency) EMERGENCY=1 ;;
+    -A|--abort) ABORT=1 ;;
+    --diff) DIFF=1 ;;
+    --max) MAX=1 ;;
+    --resume) RESUME_FLAG=1 ;;
+    --clear) CLEAR=1 ;;
+    --config) shift; [ -n "${1:-}" ] || die "--config needs a FILE"; CONFIG_OVERRIDE=$1 ;;
+    --config=*) CONFIG_OVERRIDE=${1#--config=} ;;
+    --create-config)
+      if [ -n "${2:-}" ]; then create_config "$2"; else create_config ""; fi
+      exit 0 ;;
+    --create-config=*) create_config "${1#--create-config=}"; exit 0 ;;
+    go) GO=1 ;;
+    abort) ABORT=1 ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *)
+      if   [ -z "$SRC_ARG" ]; then SRC_ARG=$1
+      elif [ -z "$TGT_ARG" ]; then TGT_ARG=$1
+      else die "too many arguments: '$1' (expected <SOURCE> <TARGET> [go])"; fi ;;
+  esac
+  shift
+done
+[ "$DBG" = 1 ] && VRB=1
+
+# bare invocation: status when clone jobs exist, otherwise the short usage
+if [ "$ABORT" = 0 ] && [ "$CLEAR" = 0 ] && [ "$GO" = 0 ] && [ -z "$SRC_ARG" ]; then
+  if find_config; then
+    load_config
+    if _have_jobs; then cmd_status; exit 0; fi
+  fi
+  usage_short
+  exit 0
+fi
+
+load_config
+
+if [ "$ABORT" = 1 ]; then
+  cmd_abort "$SRC_ARG" "$TGT_ARG"
+  exit 0
+fi
+
+if [ -z "$SRC_ARG" ] && [ -z "$TGT_ARG" ]; then
+  [ "$GO" = 1 ] && die "'go' needs <SOURCE> <TARGET>"
+  cmd_status
+  exit 0
+fi
+[ -n "$TGT_ARG" ] || die "need both <SOURCE> and <TARGET> (see --help)"
+
+resolve_volume "$SRC_ARG"
+SRC_NAME=$_rv_name SRC_CONT=$_rv_cont SRC_PHYS=$_rv_phys SRC_BYTES=$_rv_bytes
+
+TGT_MODE=volume
+TGT_FILE='' TGT_CONT='' TGT_PHYS='' TGT_BYTES='' TGT_AVAIL=''
+case $TGT_ARG in
+  *.img|*.dmg)
+    TGT_MODE='file'
+    case $TGT_ARG in /*) TGT_FILE=$TGT_ARG ;; *) TGT_FILE=$PWD/$TGT_ARG ;; esac
+    TGT_NAME=$TGT_FILE
+    case $TGT_ARG in
+      *.dmg) warn "dd writes a RAW image, not a UDIF .dmg — .img is the truthful extension" ;;
+    esac ;;
+  *)
+    if (resolve_volume "$TGT_ARG") > /dev/null 2>&1; then
+      resolve_volume "$TGT_ARG"
+      TGT_NAME=$_rv_name TGT_CONT=$_rv_cont TGT_PHYS=$_rv_phys TGT_BYTES=$_rv_bytes
+    else
+      # a PARTIAL clone overwrites the target volume, so its NAME stops
+      # resolving; recover the device from the matching unfinished job record
+      recover_target_device || resolve_volume "$TGT_ARG"
+    fi ;;
+esac
+
+[ "$DIFF" = 1 ] && [ "$EMERGENCY" = 1 ] && die "--diff and -E cannot be combined"
+[ "$DIFF" = 1 ] && [ "$RESUME_FLAG" = 1 ] && die "--diff and --resume cannot be combined"
+[ "$MAX" = 1 ] && [ "$DIFF" = 1 ] && die "--max and --diff cannot be combined (--diff writes nothing)"
+if [ "$MAX" = 1 ] && [ "$TGT_MODE" = file ]; then
+  die "--max needs a VOLUME target (an image file has no partition to grow into)"
+fi
+
+# a previous unfinished run of this exact pair enables the resume offer
+if [ "$DIFF" = 0 ] && find_resume_candidate; then
+  HAVE_RESUME=1
+  # duplicate-name/UUID trap: a partial clone makes the SOURCE volume name
+  # resolve to the half-written COPY too — the devices recorded when the job
+  # started are the truth, so trust them over today's name lookup
+  if [ -n "$RESUME_SRC_DEV" ] && [ "$SRC_PHYS" != "$RESUME_SRC_DEV" ]; then
+    _rr_bytes=$(_diskutil_bytes "$RESUME_SRC_DEV")
+    if [ "$_rr_bytes" = "$RESUME_SRC_BYTES" ]; then
+      warn "'$SRC_NAME' resolved to /dev/$SRC_PHYS, but the unfinished job recorded /dev/$RESUME_SRC_DEV — trusting the record (duplicate names after a partial clone)"
+      SRC_PHYS=$RESUME_SRC_DEV
+      SRC_BYTES=$_rr_bytes
+      SRC_CONT=$(diskutil info "$RESUME_SRC_DEV" 2>/dev/null | awk '/APFS Container/ { print $NF; exit }')
+    else
+      die "'$SRC_NAME' is ambiguous after the partial clone (resolved /dev/$SRC_PHYS, record says /dev/$RESUME_SRC_DEV, which no longer matches) — check 'diskutil list' and retry"
+    fi
+  fi
+  if [ "$TGT_MODE" = volume ] && [ -n "$TGT_PHYS" ] && [ "$TGT_PHYS" != "$RESUME_TGT_DEV" ] \
+     && printf '%s\n' "$RESUME_TGT_DEV" | grep -Eq '^disk[0-9]+s[0-9]+$'; then
+    _rr_bytes=$(_diskutil_bytes "$RESUME_TGT_DEV")
+    if printf '%s\n' "$_rr_bytes" | grep -Eq '^[0-9]+$'; then
+      warn "'$TGT_NAME' resolved to /dev/$TGT_PHYS, but the unfinished job recorded /dev/$RESUME_TGT_DEV — trusting the record"
+      TGT_PHYS=$RESUME_TGT_DEV
+      TGT_BYTES=$_rr_bytes
+      TGT_CONT=$(diskutil info "$RESUME_TGT_DEV" 2>/dev/null | awk '/APFS Container/ { print $NF; exit }')
+    else
+      die "'$TGT_NAME' is ambiguous after the partial clone (resolved /dev/$TGT_PHYS, record says /dev/$RESUME_TGT_DEV, which is gone) — check 'diskutil list' and retry"
+    fi
+  fi
+fi
+if [ "$RESUME_FLAG" = 1 ] && [ "$HAVE_RESUME" = 0 ]; then
+  die "--resume: no unfinished $([ "$EMERGENCY" = 1 ] && printf '%s' '-E ')run of $SRC_ARG -> $TGT_ARG is recorded"
+fi
+
+if [ "$DIFF" = 1 ]; then
+  preflight_diff
+elif [ "$TGT_MODE" = file ]; then
+  preflight_file
+else
+  preflight_volume
+fi
+[ "$EMERGENCY" = 1 ] && preflight_emergency
+verify_devices_with_diskutil
+
+if [ "$GO" = 1 ]; then
+  cmd_go
+else
+  print_analysis
+fi
