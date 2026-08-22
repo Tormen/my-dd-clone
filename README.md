@@ -64,7 +64,9 @@ bytes, not a UDIF image); attach later with
   log, mapfile position as fallback), plus elapsed and the log/mapfile
   paths. `--clear` drops finished/failed records. A DONE volume-target
   clone stays listed as a reminder to unplug+replug the target (see
-  Caveat); its record auto-clears once the fresh re-attach is detected.
+  Caveat), and — when the source is a Time Machine destination — to then
+  forget + re-add it in Time Machine settings; the record auto-clears
+  once each step is detected (the re-add via the destination ID changing).
 - **`-A` / `abort`** — analyze-by-default too: lists the running clones
   that match (all, by pid, or by SOURCE [TARGET]); appending `go` aborts
   them. The copy process is TERMinated first; the wrapper records exit
@@ -119,5 +121,11 @@ replug the target once** before first use — the container attached during
 the clone carries stale kernel linkage (no Disk Utility nesting/mounting,
 spurious resize refusals) until a fresh physical attach. `diskutil eject`
 is not enough, and macOS can no longer randomize APFS UUIDs
-(`apfs.util -s` is defunct). The status view keeps the job listed until
-it detects that this re-attach happened.
+(`apfs.util -s` is defunct). If the source is a **Time Machine
+destination**, its stale association also survives the replug (the old
+free space is shown and backups fail with "destination not available"):
+forget + re-add the volume in Time Machine settings — existing backups
+are kept, and the host may additionally need
+`diskutil enableOwnership /Volumes/<NAME>` if the volume shows
+`Owners: Disabled`. The status view keeps the job listed until it
+detects both the re-attach and the re-add.

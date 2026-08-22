@@ -5,7 +5,7 @@
 # arguments picks up running/finished jobs and shows their status.
 
 SCRIPT_NAME=my-dd-clone
-VERSION=1
+VERSION=1.1
 
 VRB=0
 DBG=0
@@ -122,7 +122,11 @@ detach the source, then unplug+replug the target once before first use —
 the container attached during the clone carries stale kernel linkage
 (no Disk Utility nesting/mounting, spurious resize refusals) until a
 fresh PHYSICAL attach; 'diskutil eject' is not enough, and macOS can no
-longer randomize APFS UUIDs (apfs.util -s is defunct).
+longer randomize APFS UUIDs (apfs.util -s is defunct). If the source is
+a Time Machine destination, its stale association also survives the
+replug (old free-space shown, 'destination not available'): FORGET +
+RE-ADD the volume in Time Machine settings — existing backups are kept.
+The status view reminds of both steps until it detects each happened.
 
   -V, --verbose          echo each command before running it
   -D, --debug            debug diagnostics (implies -V)
@@ -340,7 +344,7 @@ cmd_status() {
     _st_any=1
     JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_SRC_DEV='' JOB_TGT_DEV='' JOB_SRC_BYTES=''
     JOB_KIND='dd' JOB_MAP='' JOB_PID='' JOB_LOG='' JOB_EXITF='' JOB_ENDF=''
-    JOB_START_EPOCH='' JOB_OFFSET='0' JOB_TGT_PUUID=''
+    JOB_START_EPOCH='' JOB_OFFSET='0' JOB_TGT_PUUID='' JOB_SRC_TMID=''
     # shellcheck disable=SC1090  # our own job record, written by cmd_go below
     . "$_st_jf"
     _st_marker="${_st_jf%.env}.aborted"
@@ -451,13 +455,29 @@ cmd_status() {
                   | awk '/APFS Container/ { print $NF; exit }')
       if [ -n "$_st_rdev" ] && [ -n "$_st_rcont" ] \
          && diskutil list "$_st_rcont" 2>/dev/null | grep -q 'Physical Store.*disk[0-9]'; then
-        printf '    > fresh re-attach of the target detected (now /dev/%s) - record cleared\n' "$_st_rdev"
-        command rm -f "$_st_jf" "$JOB_LOG" "$JOB_EXITF" "$_st_marker"
-        [ -n "$JOB_ENDF" ] && command rm -f "$JOB_ENDF"
-        [ -n "$JOB_MAP" ] && command rm -f "$JOB_MAP"
-        continue
+        # phase 2 (source was a Time Machine destination): the replug is
+        # done, but the stale TM association survives it — remind until a
+        # destination with the same name carries a NEW ID (= forget +
+        # re-add happened in Time Machine settings)
+        _st_tmnew=
+        [ -n "$JOB_SRC_TMID" ] && _st_tmnew=$(tmutil destinationinfo 2>/dev/null \
+          | awk -v n="$JOB_SRC_NAME" -F': *' \
+            '/^Name /{name=$2} /^ID /{if(name==n){print $2; exit}}')
+        if [ -n "$JOB_SRC_TMID" ] && { [ -z "$_st_tmnew" ] || [ "$_st_tmnew" = "$JOB_SRC_TMID" ]; }; then
+          printf '    > replug detected - now FORGET + RE-ADD "%s" in Time Machine settings ! (backups are kept; auto-clears)\n' \
+            "$JOB_SRC_NAME"
+        else
+          [ -n "$JOB_SRC_TMID" ] \
+            && printf '    > fresh re-attach + Time Machine re-add detected - record cleared\n' \
+            || printf '    > fresh re-attach of the target detected (now /dev/%s) - record cleared\n' "$_st_rdev"
+          command rm -f "$_st_jf" "$JOB_LOG" "$JOB_EXITF" "$_st_marker"
+          [ -n "$JOB_ENDF" ] && command rm -f "$JOB_ENDF"
+          [ -n "$JOB_MAP" ] && command rm -f "$JOB_MAP"
+          continue
+        fi
+      else
+        printf '    > please detach the source, then UNPLUG+REPLUG the target ! (auto-clears; see --help)\n'
       fi
-      printf '    > please detach the source, then UNPLUG+REPLUG the target ! (auto-clears; see --help)\n'
     fi
 
     if [ "$CLEAR" = 1 ] && [ "$_st_state" != "RUNNING" ]; then
@@ -1068,9 +1088,16 @@ cmd_go() {
   # the target partition's own GPT UUID: survives dd and replugs, so the
   # status view can later recognize the target regardless of disk numbering
   _go_puuid=
+  _go_tmid=
   if [ "$TGT_MODE" != file ] && [ "$DIFF" = 0 ]; then
     _go_puuid=$(diskutil info "$TGT_PHYS" 2>/dev/null \
                 | awk '/Partition UUID/ { print $NF; exit }')
+    # a source that is a Time Machine destination: its destination ID at
+    # clone time — a forget + re-add later produces a DIFFERENT ID, which
+    # is how the status view detects that the re-add happened
+    _go_tmid=$(tmutil destinationinfo 2>/dev/null \
+               | awk -v n="$SRC_NAME" -F': *' \
+                 '/^Name /{name=$2} /^ID /{if(name==n){print $2; exit}}')
   fi
 
   cat > "$_go_jobf" <<EOF
@@ -1079,6 +1106,7 @@ JOB_TGT_NAME='$TGT_NAME'
 JOB_SRC_DEV='$SRC_PHYS'
 JOB_TGT_DEV='$_go_tdev'
 JOB_TGT_PUUID='$_go_puuid'
+JOB_SRC_TMID='$_go_tmid'
 JOB_SRC_BYTES='$SRC_BYTES'
 JOB_KIND='$_go_kind'
 JOB_MAP='$_go_map'
