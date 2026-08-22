@@ -5,6 +5,7 @@
 # arguments picks up running/finished jobs and shows their status.
 
 SCRIPT_NAME=my-dd-clone
+VERSION=1
 
 VRB=0
 DBG=0
@@ -49,6 +50,7 @@ usage: $SCRIPT_NAME [-V] [-D] [-E] [--max] [--resume] [--config FILE] <SOURCE> <
       --config FILE      use FILE as config, bypassing the search
       --create-config [FILE]
                          print the default config to stdout, or write it to FILE
+      --version          print version and exit
   -h                     this short usage
       --help             full help: how it works, safety checks, config, caveat
 EOF
@@ -81,6 +83,9 @@ How it works:
             RUNNING/DONE/FAILED/ABORTED with bytes done, percent, rate,
             ETA (rescued bytes + percent for -E jobs), elapsed (from the
             recorded start/end timestamps), and real/user/sys CPU time.
+            A DONE volume-target clone stays listed as a reminder until the
+            target's fresh re-attach is detected (see Caveat below), then
+            its record auto-clears.
   abort     analyze-by-default too: -A/abort lists the running clones that
             match (all, by pid, or by SOURCE [TARGET]); appending 'go'
             TERMinates their copy processes, the wrappers record exit code
@@ -105,13 +110,19 @@ physical disk.
 
 Config: searched as \$MY_DD_CLONE_CONFIG, --config FILE,
 /LINKS/default/$SCRIPT_NAME.conf, ~/.$SCRIPT_NAME.conf, /etc, /usr/local/etc.
-Tunables: DD_BS (4m, plain dd only), STATE_DIR (job records + logs,
-/var/tmp/$SCRIPT_NAME), EMERGENCY_LOG_DIR (/var/log/my-dd-clone),
+Tunables: DD_BS (4m, plain dd only), STATE_DIR (job records + logs) and
+EMERGENCY_LOG_DIR both default to /var/log/mine/<user>/$SCRIPT_NAME — per user,
+root-owned parent, so other users cannot tamper with your job records.
 DDRESCUE_RETRIES (3), EMERGENCY_BS (64k — the -E copy unit; deliberately
 small so a dying disk loses at most one small cluster per read error).
 
 Caveat: the clone is byte-identical — same APFS container/volume UUIDs as
-the source. Keep only one of the two attached.
+the source. Keep only one of the two attached. When the clone is DONE:
+detach the source, then unplug+replug the target once before first use —
+the container attached during the clone carries stale kernel linkage
+(no Disk Utility nesting/mounting, spurious resize refusals) until a
+fresh PHYSICAL attach; 'diskutil eject' is not enough, and macOS can no
+longer randomize APFS UUIDs (apfs.util -s is defunct).
 
   -V, --verbose          echo each command before running it
   -D, --debug            debug diagnostics (implies -V)
@@ -124,7 +135,7 @@ the source. Keep only one of the two attached.
                          units, and records everything in a resumable
                          mapfile — whereas plain dd would simply STOP at the
                          first read error. Log + mapfile land under
-                         \$EMERGENCY_LOG_DIR (default /var/log/my-dd-clone,
+                         \$EMERGENCY_LOG_DIR (default /var/log/mine/<user>/my-dd-clone,
                          sudo-created if missing).
                          Needs ddrescue: brew install ddrescue
       --clear            with the status view: drop finished/failed job records
@@ -144,6 +155,13 @@ note() { if [ "$VRB" = 1 ]; then printf '    > %s\n' "$*"; fi; }
 run() {
   if [ "$VRB" = 1 ]; then printf ' >>> %s\n' "$*"; fi
   "$@"
+}
+
+# like run(), but the command line also lands in the job log — the log alone
+# must tell the whole story of what was done to which device
+runj() {
+  [ -n "${_go_log:-}" ] && printf ' >>> %s\n' "$*" >> "$_go_log"
+  run "$@"
 }
 
 # kill -0 gets EPERM on the root-owned sudo'd dd, so liveness goes via ps
@@ -172,15 +190,21 @@ _default_config_content() {
 DD_BS="4m"
 EMERGENCY_BS="64k"
 
-# Directory holding job records and dd logs. Must survive the terminal
-# session (a reboot kills the dd anyway, so surviving reboots is not needed).
-STATE_DIR="/var/tmp/my-dd-clone"
+# Directory holding job records and dd logs — PER USER, under a root-owned
+# parent, so no other user can tamper with (or plant) your job records.
+# Created via sudo and chown'd to you on first 'go' if missing.
+# Standard alternative (without the /var/log/mine layout):
+#   STATE_DIR="/var/lib/my-dd-clone/$(id -un)"
+# Or, sudo-free: /var/tmp/my-dd-clone/$(id -un) — but its world-writable
+# parent lets any user delete your records, and /var/tmp may be cleaned
+# periodically; /var/log persists and its parent stays root-owned.
+STATE_DIR="/var/lib/mine/$(id -un)/my-dd-clone"
 
 # -E / --emergency (dying-disk mode, uses GNU ddrescue):
 # where the ddrescue log and resume mapfile go (created via sudo and chown'd
 # to you if missing), and how many retry passes ddrescue makes over the bad
 # areas after the first careful full read.
-EMERGENCY_LOG_DIR="/var/log/my-dd-clone"
+EMERGENCY_LOG_DIR="/var/log/mine/$(id -un)/my-dd-clone"
 DDRESCUE_RETRIES="3"
 EOF
 }
@@ -312,10 +336,11 @@ cmd_status() {
   _st_any=0
   for _st_jf in "$STATE_DIR"/job.*.env; do
     [ -f "$_st_jf" ] || continue
+    _rec_trusted "$_st_jf" || { warn "ignoring job record not owned by root/you: $_st_jf"; continue; }
     _st_any=1
     JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_SRC_DEV='' JOB_TGT_DEV='' JOB_SRC_BYTES=''
     JOB_KIND='dd' JOB_MAP='' JOB_PID='' JOB_LOG='' JOB_EXITF='' JOB_ENDF=''
-    JOB_START_EPOCH='' JOB_OFFSET='0'
+    JOB_START_EPOCH='' JOB_OFFSET='0' JOB_TGT_PUUID=''
     # shellcheck disable=SC1090  # our own job record, written by cmd_go below
     . "$_st_jf"
     _st_marker="${_st_jf%.env}.aborted"
@@ -383,6 +408,19 @@ cmd_status() {
       _st_prog="no progress line yet in $JOB_LOG"
     fi
 
+    # a --max job: append the resize outcome to the progress line
+    if [ -f "$JOB_EXITF" ] \
+       && tr '\r' '\n' < "$JOB_LOG" 2>/dev/null | grep -q '^MAX: growing'; then
+      _st_mx=$(tr '\r' '\n' < "$JOB_LOG" | sed -n '/^MAX: growing/,$p')
+      if printf '%s\n' "$_st_mx" | grep -q '^MAX: SUCCESS' \
+         || ! printf '%s\n' "$_st_mx" | grep -q '^Error'; then
+        _st_mxb=$(_diskutil_bytes "$JOB_TGT_DEV")
+        _st_prog="$_st_prog --then-maxed-to--> ${_st_mxb:+$(_human_bytes "$_st_mxb") }(SUCCESS)"
+      else
+        _st_prog="$_st_prog --then-maxed--> FAILED ($(printf '%s\n' "$_st_mx" | grep '^Error' | tail -n 1))"
+      fi
+    fi
+
     _st_end=$(date +%s)
     if [ -f "$JOB_ENDF" ]; then read -r _st_end < "$JOB_ENDF" 2>/dev/null; fi
     _st_elapsed=$(_fmt_elapsed $(( _st_end - JOB_START_EPOCH )))
@@ -401,6 +439,27 @@ cmd_status() {
     printf '    > log: %s\n' "$JOB_LOG"
     [ -n "$JOB_MAP" ] && printf '    > ddrescue mapfile: %s\n' "$JOB_MAP"
 
+    # a DONE volume-target clone stays listed as a reminder until the target
+    # was PHYSICALLY unplugged+replugged (see the --help caveat): the stale
+    # first attach after dd shows the container with an EMPTY physical-store
+    # list, a healed fresh attach lists the store — detected via the target
+    # partition's own GPT UUID, which survives both dd and replugs
+    if [ "$_st_state" = "DONE" ] && [ "$JOB_KIND" != diff ] && [ -n "$JOB_TGT_PUUID" ]; then
+      _st_rdev=$(diskutil info "$JOB_TGT_PUUID" 2>/dev/null \
+                 | awk '/Device Identifier/ { print $NF; exit }')
+      _st_rcont=$(diskutil info "$JOB_TGT_PUUID" 2>/dev/null \
+                  | awk '/APFS Container/ { print $NF; exit }')
+      if [ -n "$_st_rdev" ] && [ -n "$_st_rcont" ] \
+         && diskutil list "$_st_rcont" 2>/dev/null | grep -q 'Physical Store.*disk[0-9]'; then
+        printf '    > fresh re-attach of the target detected (now /dev/%s) - record cleared\n' "$_st_rdev"
+        command rm -f "$_st_jf" "$JOB_LOG" "$JOB_EXITF" "$_st_marker"
+        [ -n "$JOB_ENDF" ] && command rm -f "$JOB_ENDF"
+        [ -n "$JOB_MAP" ] && command rm -f "$JOB_MAP"
+        continue
+      fi
+      printf '    > please detach the source, then UNPLUG+REPLUG the target ! (auto-clears; see --help)\n'
+    fi
+
     if [ "$CLEAR" = 1 ] && [ "$_st_state" != "RUNNING" ]; then
       command rm -f "$_st_jf" "$JOB_LOG" "$JOB_EXITF" "$_st_marker"
       [ -n "$JOB_ENDF" ] && command rm -f "$JOB_ENDF"
@@ -411,6 +470,14 @@ cmd_status() {
   if [ "$_st_any" = 0 ]; then
     printf '%s: no clone jobs recorded in %s\n' "$SCRIPT_NAME" "$STATE_DIR"
   fi
+}
+
+# job records are '.'-sourced — trust only files owned by root or ourselves
+# (the state dir can be written by other users; never execute their content)
+_rec_trusted() {
+  # shellcheck disable=SC2012  # ls -ln for the owner uid only; paths are our own job files
+  _rt_o=$(ls -ln "$1" 2>/dev/null | awk '{ print $3 }')
+  [ "$_rt_o" = "0" ] || [ "$_rt_o" = "$(id -u)" ]
 }
 
 _have_jobs() {
@@ -439,6 +506,7 @@ cmd_abort() {
   _have_jobs || die "no clone jobs recorded in ${STATE_DIR:-?}"
   for _ab_jf in "$STATE_DIR"/job.*.env; do
     [ -f "$_ab_jf" ] || continue
+    _rec_trusted "$_ab_jf" || { warn "ignoring job record not owned by root/you: $_ab_jf"; continue; }
     JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_PID='' JOB_EXITF=''
     # shellcheck disable=SC1090  # our own job record
     . "$_ab_jf"
@@ -625,6 +693,7 @@ recover_target_device() {
   [ -d "$STATE_DIR" ] || return 1
   for _rd_jf in "$STATE_DIR"/job.*.env; do
     [ -f "$_rd_jf" ] || continue
+    _rec_trusted "$_rd_jf" || { warn "ignoring job record not owned by root/you: $_rd_jf"; continue; }
     JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_TGT_DEV='' JOB_PID='' JOB_EXITF=''
     # shellcheck disable=SC1090  # our own job record
     . "$_rd_jf"
@@ -663,6 +732,7 @@ find_resume_candidate() {
   [ -d "$STATE_DIR" ] || return 1
   for _fr_jf in "$STATE_DIR"/job.*.env; do
     [ -f "$_fr_jf" ] || continue
+    _rec_trusted "$_fr_jf" || { warn "ignoring job record not owned by root/you: $_fr_jf"; continue; }
     JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_SRC_DEV='' JOB_TGT_DEV='' JOB_SRC_BYTES=''
     JOB_KIND='dd' JOB_MAP='' JOB_PID='' JOB_LOG='' JOB_EXITF='' JOB_OFFSET='0'
     # shellcheck disable=SC1090  # our own job record
@@ -717,6 +787,7 @@ check_no_conflicting_job() {
   [ -d "$STATE_DIR" ] || return 0
   for _cj_jf in "$STATE_DIR"/job.*.env; do
     [ -f "$_cj_jf" ] || continue
+    _rec_trusted "$_cj_jf" || { warn "ignoring job record not owned by root/you: $_cj_jf"; continue; }
     JOB_SRC_DEV='' JOB_TGT_DEV='' JOB_PID='' JOB_EXITF=''
     # shellcheck disable=SC1090  # our own job record
     . "$_cj_jf"
@@ -805,9 +876,20 @@ EOF
   fi
 }
 
+_ensure_dir_owned() {
+  # create $1 (via sudo when not root) and make the invoking user own it
+  [ -d "$1" ] && [ -w "$1" ] && return 0
+  if [ "$_go_sudo" = 1 ]; then
+    if ! run sudo mkdir -p "$1" || ! run sudo chown "$(id -u):$(id -g)" "$1"; then
+      die "cannot create/own $1"
+    fi
+  else
+    run mkdir -p "$1" || die "cannot create $1"
+  fi
+}
+
 cmd_go() {
   check_no_conflicting_job
-  mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
 
   # unfinished previous run of this exact SOURCE -> TARGET -> offer to resume.
   # Only the literal answers 'resume' / 'new' proceed; anything else stops.
@@ -835,6 +917,36 @@ cmd_go() {
     fi
   fi
 
+  # any UNFINISHED record of this pair is superseded the moment a fresh run
+  # starts (its offset/log describe a target state about to be overwritten) —
+  # drop such records; completed runs stay, a mapfile being reused survives
+  if [ "$DIFF" = 0 ]; then
+    _go_keepmap=
+    [ "$_go_resume" = 1 ] && _go_keepmap=$RESUME_MAP
+    _go_wiped=0
+    for _go_jf in "$STATE_DIR"/job.*.env; do
+      [ -f "$_go_jf" ] || continue
+    _rec_trusted "$_go_jf" || { warn "ignoring job record not owned by root/you: $_go_jf"; continue; }
+      JOB_SRC_NAME='' JOB_TGT_NAME='' JOB_MAP='' JOB_PID='' JOB_EXITF='' JOB_ENDF='' JOB_LOG=''
+      # shellcheck disable=SC1090  # our own job record
+      . "$_go_jf"
+      [ "$(_sel_norm "$JOB_SRC_NAME")" = "$(_sel_norm "$SRC_NAME")" ] || continue
+      [ "$(_sel_norm "$JOB_TGT_NAME")" = "$(_sel_norm "$TGT_NAME")" ] || continue
+      if [ -f "$JOB_EXITF" ]; then
+        read -r _go_e < "$JOB_EXITF" 2>/dev/null
+        [ "$_go_e" = "0" ] && continue
+      elif _pid_alive "$JOB_PID"; then
+        continue
+      fi
+      command rm -f "$_go_jf" "$JOB_LOG" "$JOB_EXITF" "${_go_jf%.env}.aborted"
+      [ -n "$JOB_ENDF" ] && command rm -f "$JOB_ENDF"
+      [ -n "$JOB_MAP" ] && [ "$JOB_MAP" != "$_go_keepmap" ] && command rm -f "$JOB_MAP"
+      _go_wiped=$((_go_wiped + 1))
+    done
+    [ "$_go_wiped" -gt 0 ] \
+      && printf '    > dropped %d superseded unfinished record(s) of this pair\n' "$_go_wiped"
+  fi
+
   _go_sudo=0
   if [ "$(id -u)" -ne 0 ]; then
     _go_sudo=1
@@ -842,30 +954,8 @@ cmd_go() {
     sudo -v || die "sudo authentication failed"
   fi
 
-  if [ "$EMERGENCY" = 1 ] && { [ ! -d "$EMERGENCY_LOG_DIR" ] || [ ! -w "$EMERGENCY_LOG_DIR" ]; }; then
-    if [ "$_go_sudo" = 1 ]; then
-      if ! run sudo mkdir -p "$EMERGENCY_LOG_DIR" \
-         || ! run sudo chown "$(id -u):$(id -g)" "$EMERGENCY_LOG_DIR"; then
-        die "cannot create/own $EMERGENCY_LOG_DIR"
-      fi
-      note "created $EMERGENCY_LOG_DIR (via sudo) and chown'd it to you"
-    else
-      run mkdir -p "$EMERGENCY_LOG_DIR" || die "cannot create $EMERGENCY_LOG_DIR"
-    fi
-  fi
-
-  run diskutil unmountDisk "$SRC_CONT" \
-    || die "could not unmount the source container $SRC_CONT"
-  note "all volumes in the source container are now unmounted (consistent read)"
-  if [ "$TGT_MODE" != file ]; then
-    if [ -n "$TGT_CONT" ]; then
-      run diskutil unmountDisk "$TGT_CONT" \
-        || die "could not unmount the target container $TGT_CONT"
-      note "all volumes in the target container are now unmounted (nothing holds the device open)"
-    else
-      note "target container unknown (recovered device) — nothing mounted to unmount"
-    fi
-  fi
+  _ensure_dir_owned "$STATE_DIR"
+  [ "$EMERGENCY" = 1 ] && _ensure_dir_owned "$EMERGENCY_LOG_DIR"
 
   _go_id=$(date +%Y%m%d-%H%M%S).$$
   _go_map=
@@ -885,6 +975,22 @@ cmd_go() {
     _go_of="'$TGT_FILE'" _go_tdev=$TGT_FILE
   else
     _go_of=/dev/r$TGT_PHYS _go_tdev=$TGT_PHYS
+  fi
+
+  printf '%s: job %s  %s -> %s  (reading /dev/r%s, %s bytes; writing %s)\n' \
+    "$SCRIPT_NAME" "$_go_id" "$SRC_NAME" "$TGT_NAME" "$SRC_PHYS" "$SRC_BYTES" "$_go_of" >> "$_go_log"
+
+  runj diskutil unmountDisk "$SRC_CONT" \
+    || die "could not unmount the source container $SRC_CONT"
+  note "all volumes in the source container are now unmounted (consistent read)"
+  if [ "$TGT_MODE" != file ]; then
+    if [ -n "$TGT_CONT" ]; then
+      runj diskutil unmountDisk "$TGT_CONT" \
+        || die "could not unmount the target container $TGT_CONT"
+      note "all volumes in the target container are now unmounted (nothing holds the device open)"
+    else
+      note "target container unknown (recovered device) — nothing mounted to unmount"
+    fi
   fi
 
   # resume of a plain dd: skip/seek in whole blocks, rewound 16 blocks so the
@@ -917,14 +1023,35 @@ cmd_go() {
     _go_chown=
     [ "$TGT_MODE" = file ] && _go_chown="'$TGT_FILE'"
     [ -n "$_go_map" ] && _go_chown="$_go_chown '$_go_map'"
-    [ -n "$_go_chown" ] && _go_chown_cmd="chown $(id -u):$(id -g) $_go_chown; "
+    if [ -n "$_go_chown" ]; then
+      _go_chown_line="chown $(id -u):$(id -g) $_go_chown"
+      _go_chown_cmd="echo \" >>> $_go_chown_line\"; $_go_chown_line; "
+    fi
   fi
   _go_max_cmd=
   if [ "$MAX" = 1 ]; then
-    _go_max_cmd="if [ \$_rc -eq 0 ]; then echo 'MAX: growing the APFS container to fill the partition'; diskutil apfs resizeContainer $TGT_PHYS 0; fi; "
+    # 'resizeContainer <store> 0' can fail with -69743 forever: diskutil
+    # compares the requested size against the STORE (= partition) size, not
+    # the container ceiling, so on a cloned store 'grow to fill' reads as a
+    # size no-op no matter how often it is retried.
+    # Escalation (each step only when the previous keeps failing):
+    #   1. settle + retry the plain grow-to-fill (works on healthy attaches)
+    #   2. repairDisk the whole target disk, then grow-to-fill again
+    #      (the documented fix for stale partition-map bookkeeping)
+    #   3. explicit grow to partition size minus 128MB: differs from the
+    #      store size by more than diskutil's minimum-delta threshold
+    #      (~100MB, error -69742), so it is accepted and moves the ceiling
+    #      to within 128MB of full — the closest diskutil allows here
+    _go_max_line="diskutil apfs resizeContainer $TGT_PHYS 0"
+    _go_max_repair="diskutil repairDisk ${TGT_PHYS%s*}"
+    _go_max_step=$((TGT_BYTES - 128 * 1024 * 1024))
+    _go_max_line2="diskutil apfs resizeContainer $TGT_PHYS ${_go_max_step}B"
+    _go_max_cmd="if [ \$_rc -eq 0 ]; then echo 'MAX: growing the APFS container to fill the partition'; _mx=1; while [ \$_mx -le 3 ]; do sleep 10; echo \" >>> $_go_max_line\"; if $_go_max_line; then echo 'MAX: SUCCESS'; _mx=0; break; fi; echo \"MAX: attempt \$_mx failed - waiting for the disk to settle\"; _mx=\$((_mx+1)); done; if [ \$_mx -gt 3 ]; then echo 'MAX: repairing the target disk, then retrying'; echo \" >>> $_go_max_repair\"; echo y | $_go_max_repair; echo \" >>> $_go_max_line\"; if $_go_max_line; then echo 'MAX: SUCCESS'; else echo 'MAX: falling back to an explicit grow (128MB below the partition size)'; echo \" >>> $_go_max_line2\"; if $_go_max_line2; then echo 'MAX: SUCCESS (128MB of the partition stay unclaimed - diskutil refuses smaller deltas)'; else echo \"MAX: FAILED - grow it yourself: $_go_max_line2\"; fi; fi; fi; fi; "
   fi
   # the wrapper's trap records exit code + end time even when it is TERMinated
   _go_cmd="trap \"echo 143 > '$_go_exitf'; date +%s > '$_go_endf'\" TERM INT; $_go_body; _rc=\$?; ${_go_max_cmd}${_go_chown_cmd}echo \$_rc > '$_go_exitf'; date +%s > '$_go_endf'"
+  # the copy command itself, logged from the very string the wrapper executes
+  printf ' >>> %s\n' "$_go_body" >> "$_go_log"
   if [ "$VRB" = 1 ]; then
     if [ "$_go_sudo" = 1 ]; then printf ' >>> nohup sudo -n sh -c "%s" &\n' "$_go_cmd"
     else printf ' >>> nohup sh -c "%s" &\n' "$_go_cmd"; fi
@@ -938,11 +1065,20 @@ cmd_go() {
   fi
   _go_pid=$!
 
+  # the target partition's own GPT UUID: survives dd and replugs, so the
+  # status view can later recognize the target regardless of disk numbering
+  _go_puuid=
+  if [ "$TGT_MODE" != file ] && [ "$DIFF" = 0 ]; then
+    _go_puuid=$(diskutil info "$TGT_PHYS" 2>/dev/null \
+                | awk '/Partition UUID/ { print $NF; exit }')
+  fi
+
   cat > "$_go_jobf" <<EOF
 JOB_SRC_NAME='$SRC_NAME'
 JOB_TGT_NAME='$TGT_NAME'
 JOB_SRC_DEV='$SRC_PHYS'
 JOB_TGT_DEV='$_go_tdev'
+JOB_TGT_PUUID='$_go_puuid'
 JOB_SRC_BYTES='$SRC_BYTES'
 JOB_KIND='$_go_kind'
 JOB_MAP='$_go_map'
@@ -975,6 +1111,9 @@ EOF
   printf '    > log: %s\n' "$_go_log"
   [ -n "$_go_map" ] && printf '    > ddrescue mapfile (resume state): %s\n' "$_go_map"
   printf '    > check progress with: %s\n' "$SCRIPT_NAME"
+  if [ "$DIFF" = 0 ] && [ "$TGT_MODE" != file ]; then
+    printf '    > when DONE: detach the source, then unplug+replug the target once (see --help caveat)\n'
+  fi
 }
 
 # ------------------------------------------------------------------ main ----
@@ -985,6 +1124,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     -h) usage_short; exit 0 ;;
     --help) usage; exit 0 ;;
+    --version) printf '%s v%s\n' "$SCRIPT_NAME" "$VERSION"; exit 0 ;;
     -V|--verbose) VRB=1 ;;
     -D|--debug) DBG=1 ;;
     -E|--emergency) EMERGENCY=1 ;;

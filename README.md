@@ -38,18 +38,21 @@ bytes, not a UDIF image); attach later with
   good sectors are read exactly **once**, then only the bad areas get
   trim/scrape plus `DDRESCUE_RETRIES` retry passes — minimal stress on a
   failing source. Log and resume mapfile land under `EMERGENCY_LOG_DIR`
-  (default `/var/log/my-dd-clone`, sudo-created and chown'd to you if
-  missing). Needs `brew install ddrescue`.
+  (default `/var/log/mine/$(id -un)/my-dd-clone`, sudo-created and chown'd
+  to you if missing). Needs `brew install ddrescue`.
 - **Resume** — an unfinished run of the same SOURCE → TARGET pair makes
   `go` ask: type `resume` to continue (dd: skip/seek to the recorded
   offset minus a 16-block safety rewind; `-E`: reuse the mapfile, so only
   unread/bad areas are touched) or `new` to start over. `--resume` skips
   the question (for scripts). Works for disk→disk and disk→image alike.
 - **`--max`** — a clone onto a larger volume target leaves the copied APFS
-  container at the source's size; `--max` automatically runs
-  `diskutil apfs resizeContainer <targetStore> 0` (0 = fill the partition)
-  after a successful copy (resize output in the job log). Without it, the
-  analyze warning points you here. Volume targets only.
+  container at the source's size; `--max` automatically grows it to fill
+  the partition after a successful copy, escalating as needed:
+  `diskutil apfs resizeContainer <targetStore> 0` with settle+retries,
+  then `repairDisk` + retry, then an explicit grow to 128 MB below the
+  partition size (diskutil refuses smaller deltas on a cloned store). All
+  attempts land in the job log. Without `--max`, the analyze warning
+  points you here. Volume targets only.
 - **`--diff`** — compares instead of cloning: unmounts both sides, reads
   each exactly once, sha256s the first source-length bytes, and reports
   IDENTICAL/DIFFER in the status view. Volume or existing-image target.
@@ -59,7 +62,9 @@ bytes, not a UDIF image); attach later with
   get bytes done, percent, rate, ETA (parsed from dd's progress lines in
   the log); `-E` jobs get rescued bytes and percent (from the ddrescue
   log, mapfile position as fallback), plus elapsed and the log/mapfile
-  paths. `--clear` drops finished/failed records.
+  paths. `--clear` drops finished/failed records. A DONE volume-target
+  clone stays listed as a reminder to unplug+replug the target (see
+  Caveat); its record auto-clears once the fresh re-attach is detected.
 - **`-A` / `abort`** — analyze-by-default too: lists the running clones
   that match (all, by pid, or by SOURCE [TARGET]); appending `go` aborts
   them. The copy process is TERMinated first; the wrapper records exit
@@ -69,6 +74,10 @@ bytes, not a UDIF image); attach later with
 - **Accounting** — start/end timestamps are recorded, and the copy runs
   under `/usr/bin/time -p`; finished jobs show elapsed plus
   real/user/sys CPU seconds in the status view.
+- **Audit trail** — the job log records every command the job issues
+  (` >>> ` lines): the unmounts, the exact dd/ddrescue/diff command,
+  every `--max` resize attempt, and the final chown — the log alone
+  tells the whole story of what was done to which device.
 
 ## Safety checks (before anything runs)
 
@@ -92,14 +101,23 @@ Standard search order (`$MY_DD_CLONE_CONFIG`, `--config FILE`,
 lists the locations and exits. Create with
 `my-dd-clone --create-config /LINKS/default/my-dd-clone.conf`.
 Tunables: `DD_BS` (block size, default `4m`, plain dd only — it does NOT
-apply to `-E`), `STATE_DIR` (job records + logs, default
-`/var/tmp/my-dd-clone`), `EMERGENCY_LOG_DIR` (`-E` log + mapfile, default
-`/var/log/my-dd-clone`), `DDRESCUE_RETRIES` (default `3`), `EMERGENCY_BS`
-(the `-E` copy unit, default `64k` — deliberately small so a read error on
-a dying disk loses at most one small cluster).
+apply to `-E`), `STATE_DIR` (job records + logs) and `EMERGENCY_LOG_DIR`
+(`-E` log + mapfile), both defaulting to `/var/log/mine/$(id -un)/my-dd-clone`
+— per user under a root-owned parent, so other users can neither tamper
+with nor plant job records (which are sourced; only files owned by root
+or the invoking user are trusted), sudo-created on first `go` —
+`DDRESCUE_RETRIES` (default `3`), and `EMERGENCY_BS` (the `-E` copy unit,
+default `64k` — deliberately small so a read error on a dying disk loses
+at most one small cluster).
 
 ## Caveat
 
 A successful clone is byte-identical — same APFS container/volume UUIDs as
 the source. macOS can get confused with both attached; keep only one
-connected, or let Disk Utility handle the duplicate-UUID situation.
+connected. When the clone is DONE: detach the source, then **unplug and
+replug the target once** before first use — the container attached during
+the clone carries stale kernel linkage (no Disk Utility nesting/mounting,
+spurious resize refusals) until a fresh physical attach. `diskutil eject`
+is not enough, and macOS can no longer randomize APFS UUIDs
+(`apfs.util -s` is defunct). The status view keeps the job listed until
+it detects that this re-attach happened.
