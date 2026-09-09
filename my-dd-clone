@@ -232,7 +232,9 @@ find_config() {
   elif [ -n "$CONFIG_OVERRIDE" ]; then
     _lc_file=$CONFIG_OVERRIDE
   else
-    for _lc_c in /LINKS/default/my-dd-clone.conf "$HOME/.my-dd-clone.conf" \
+    ## both spellings are accepted under /LINKS/default: .conf first, then bare
+    for _lc_c in /LINKS/default/my-dd-clone.conf /LINKS/default/my-dd-clone \
+                 "$HOME/.my-dd-clone.conf" \
                  /etc/my-dd-clone.conf /usr/local/etc/my-dd-clone.conf; do
       if [ -f "$_lc_c" ]; then _lc_file=$_lc_c; break; fi
     done
