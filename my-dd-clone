@@ -11,8 +11,8 @@ SCRIPT_NAME=my-dd-clone
 # tag>-<commits since it>-g<short sha>); both are written by 'stamp-version'
 # so a deployed copy with no git can still say what it is.
 VERSION=1.1
-SCRIPT_COMMIT="25e88a3"
-SCRIPT_RELEASE="v1.1-6-g25e88a3"
+SCRIPT_COMMIT="e509c00"
+SCRIPT_RELEASE="v1.1-8-ge509c00"
 
 # The first 12 hex of this file's own SHA-256: the value that actually
 # identifies the bytes, so comparing two installs is running --version on
@@ -141,6 +141,7 @@ HAVE_RESUME=0
 RESUME_DONE=0
 RESUME_MAP=
 CONFIG_OVERRIDE=
+SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
 
 usage_short() {
   cat <<EOF
@@ -172,7 +173,9 @@ usage: $SCRIPT_NAME [-V] [-D] [-E] [--max] [--resume] [--config FILE] <SOURCE> <
       --create-config [FILE]
                          print the default config to stdout, or write it to FILE
       --version          print version, release state and build id, and exit
-  stamp-version          record this commit + 'git describe' in the file and
+      --run-tests [FILTER]
+                         run the built-in tests (name substring), TAP output
+  stamp-version         record this commit + 'git describe' in the file and
                          amend, so a deployed copy can say what it is
   -h                     this short usage
       --help             full help: how it works, safety checks, config, caveat
@@ -231,11 +234,16 @@ job; file targets: existing file, insufficient free space, image path on
 a volume of the source container. Warns when source and target share one
 physical disk.
 
-Config: searched as \$MY_DD_CLONE_CONFIG, --config FILE,
-/LINKS/default/$SCRIPT_NAME.conf, ~/.$SCRIPT_NAME.conf, /etc, /usr/local/etc.
-Tunables: DD_BS (4m, plain dd only), STATE_DIR (job records + logs) and
-EMERGENCY_LOG_DIR both default to /var/log/mine/<user>/$SCRIPT_NAME — per user,
-root-owned parent, so other users cannot tamper with your job records.
+Config (first found wins): \$MY_DD_CLONE_CONFIG, --config FILE,
+\$CONFIG_SEARCH_DIR/$SCRIPT_NAME.conf, then \$CONFIG_SEARCH_DIR/$SCRIPT_NAME,
+~/.$SCRIPT_NAME.conf, /etc/$SCRIPT_NAME.conf, /usr/local/etc/$SCRIPT_NAME.conf.
+$SITE_CONF, when there, is read first: the site's
+CONFIG_SEARCH_DIR, DATA_BASE_DIR and LOG_BASE_DIR (/var/db and /var/log
+without the file). There but unreadable: an error.
+Tunables: DD_BS (4m, plain dd only), STATE_DIR (job records + logs; default
+\$DATA_BASE_DIR/<user>/$SCRIPT_NAME) and EMERGENCY_LOG_DIR (default
+\$LOG_BASE_DIR/<user>/$SCRIPT_NAME) — per user, root-owned parent, so other
+users cannot tamper with your job records.
 DDRESCUE_RETRIES (3), EMERGENCY_BS (64k — the -E copy unit; deliberately
 small so a dying disk loses at most one small cluster per read error).
 
@@ -262,7 +270,7 @@ The status view reminds of both steps until it detects each happened.
                          units, and records everything in a resumable
                          mapfile — whereas plain dd would simply STOP at the
                          first read error. Log + mapfile land under
-                         \$EMERGENCY_LOG_DIR (default /var/log/mine/<user>/my-dd-clone,
+                         \$EMERGENCY_LOG_DIR (default \$LOG_BASE_DIR/<user>/my-dd-clone,
                          sudo-created if missing).
                          Needs ddrescue: brew install ddrescue
       --clear            with the status view: drop finished/failed job records
@@ -320,18 +328,18 @@ EMERGENCY_BS="64k"
 # Directory holding job records and dd logs — PER USER, under a root-owned
 # parent, so no other user can tamper with (or plant) your job records.
 # Created via sudo and chown'd to you on first 'go' if missing.
-# Standard alternative (without the /var/log/mine layout):
-#   STATE_DIR="/var/lib/my-dd-clone/$(id -un)"
-# Or, sudo-free: /var/tmp/my-dd-clone/$(id -un) — but its world-writable
+# DATA_BASE_DIR comes from the site file (/var/db without it).
+# Or,sudo-free: /var/tmp/my-dd-clone/$(id -un) — but its world-writable
 # parent lets any user delete your records, and /var/tmp may be cleaned
-# periodically; /var/log persists and its parent stays root-owned.
-STATE_DIR="/var/lib/mine/$(id -un)/my-dd-clone"
+# periodically; the default persists and its parent stays root-owned.
+STATE_DIR="$DATA_BASE_DIR/$(id -un)/my-dd-clone"
 
 # -E / --emergency (dying-disk mode, uses GNU ddrescue):
 # where the ddrescue log and resume mapfile go (created via sudo and chown'd
 # to you if missing), and how many retry passes ddrescue makes over the bad
-# areas after the first careful full read.
-EMERGENCY_LOG_DIR="/var/log/mine/$(id -un)/my-dd-clone"
+# areas after the first careful full read. LOG_BASE_DIR comes from the site
+# file (/var/log without it).
+EMERGENCY_LOG_DIR="$LOG_BASE_DIR/$(id -un)/my-dd-clone"
 DDRESCUE_RETRIES="3"
 EOF
 }
@@ -347,6 +355,52 @@ create_config() {
   printf '%s: wrote default config to %s\n' "$SCRIPT_NAME" "$1"
 }
 
+# The site's values for every tool, from SITE_CONF -- the one site path this
+# tool knows -- read before its own config: the base directories, where a
+# config is searched and where one is offered. The neutral values first, so
+# an exported variable never takes their place; then the file, plain
+# KEY="value" lines, when it is there.
+read_site() {
+  DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
+  CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
+  [ -e "$SITE_CONF" ] || return 0
+  # there but unreadable: an error, never the neutral values -- they would
+  # keep this user's job records apart from everyone else's
+  [ -r "$SITE_CONF" ] || die "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
+  # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
+  . "$SITE_CONF" || die "'$SITE_CONF' failed to load"
+}
+
+config_search_paths() {
+  [ -z "$CONFIG_SEARCH_DIR" ] || printf '%s\n' "$CONFIG_SEARCH_DIR/my-dd-clone.conf" "$CONFIG_SEARCH_DIR/my-dd-clone"
+  printf '%s\n' "$HOME/.my-dd-clone.conf" /etc/my-dd-clone.conf /usr/local/etc/my-dd-clone.conf
+}
+
+# The offer names only paths the search reads, most common place first: the
+# site's offer directory -- only where the site's search directory is
+# searched, which a file there reaches as the note says; never the search
+# directory itself, a farm -- then /etc, then ~.
+config_offer_paths() {
+  if [ -n "$CONFIG_OFFER_DIR" ] && [ -n "$CONFIG_SEARCH_DIR" ]; then printf '%s\n' "$CONFIG_OFFER_DIR/my-dd-clone.conf"; fi
+  for _co_o in /etc/my-dd-clone.conf "$HOME/.my-dd-clone.conf"; do
+    config_search_paths | grep -qx "$_co_o" && printf '%s\n' "$_co_o"
+  done
+}
+
+# "no config found": each offered place a paste-ready line, the site's note
+# beside its own place.
+no_config_offer() {
+  echo "!!! no config found -- write one, most common place first:"
+  config_offer_paths | while IFS= read -r _no_o; do
+    if [ "$_no_o" = "$CONFIG_OFFER_DIR/my-dd-clone.conf" ] && [ -n "$CONFIG_OFFER_NOTE" ]; then
+      echo "    > $SCRIPT_NAME --create-config > $_no_o   ($CONFIG_OFFER_NOTE)"
+    else
+      echo "    > $SCRIPT_NAME --create-config > $_no_o"
+    fi
+  done
+  echo "    (--help: the full search order)"
+}
+
 find_config() {
   # sets _lc_file; returns 1 (silently) when no config exists
   _lc_file=
@@ -355,12 +409,11 @@ find_config() {
   elif [ -n "$CONFIG_OVERRIDE" ]; then
     _lc_file=$CONFIG_OVERRIDE
   else
-    ## both spellings are accepted under /LINKS/default: .conf first, then bare
-    for _lc_c in /LINKS/default/my-dd-clone.conf /LINKS/default/my-dd-clone \
-                 "$HOME/.my-dd-clone.conf" \
-                 /etc/my-dd-clone.conf /usr/local/etc/my-dd-clone.conf; do
+    while IFS= read -r _lc_c; do
       if [ -f "$_lc_c" ]; then _lc_file=$_lc_c; break; fi
-    done
+    done <<EOF
+$(config_search_paths)
+EOF
   fi
   [ -n "$_lc_file" ] && [ -f "$_lc_file" ]
 }
@@ -370,13 +423,7 @@ load_config() {
     [ -n "${MY_DD_CLONE_CONFIG:-}" ] \
       && die "\$MY_DD_CLONE_CONFIG points to a missing file: $MY_DD_CLONE_CONFIG"
     [ -n "$CONFIG_OVERRIDE" ] && die "--config file not found: $CONFIG_OVERRIDE"
-    printf '%s: no config file found. Searched (in order):\n' "$SCRIPT_NAME" >&2
-    # shellcheck disable=SC2016  # the env-var NAME itself is the message here
-    for _lc_c in '$MY_DD_CLONE_CONFIG' '--config FILE' /LINKS/default/my-dd-clone.conf \
-                 "$HOME/.my-dd-clone.conf" /etc/my-dd-clone.conf /usr/local/etc/my-dd-clone.conf; do
-      printf '  %s\n' "$_lc_c" >&2
-    done
-    printf 'Create one with:  %s --create-config /LINKS/default/my-dd-clone.conf\n' "$SCRIPT_NAME" >&2
+    no_config_offer >&2
     exit 1
   fi
   dbg "config file: $_lc_file"
@@ -1269,6 +1316,111 @@ EOF
   fi
 }
 
+# ----------------------------------------------------------------- tests ----
+
+# --run-tests [FILTER]: TAP -- the plan first, then one line per test, a
+# failed test's detail below it as '#' lines. Each test runs in a subshell
+# with a temp directory of its own (T_DIR) and never reads the machine's
+# site file or configs: SITE_CONF and HOME point into T_DIR.
+T_LIST="t_every_test_is_listed t_site_conf_gives_the_bases_the_search_and_the_offer
+  t_config_offer_names_only_searched_paths"
+
+t_every_test_is_listed() {
+  _t_def=$(grep -c '^t_[a-z_]*() {' "$0")
+  _t_lst=0
+  for _t_t in $T_LIST; do _t_lst=$((_t_lst + 1)); done
+  [ "$_t_def" = "$_t_lst" ] || { echo "defined $_t_def, listed $_t_lst"; return 1; }
+}
+
+# The neutral values win over the environment; the site file gives the
+# bases (STATE_DIR and EMERGENCY_LOG_DIR lie under them), the search
+# directory (.conf, then the bare name) and the offer with its note; there
+# but unreadable is an error, never the neutral values.
+t_site_conf_gives_the_bases_the_search_and_the_offer() {
+  SITE_CONF="$T_DIR/site.conf"; HOME="$T_DIR/home"; MY_DD_CLONE_CONFIG=; CONFIG_OVERRIDE=
+  _t_u=$(id -un)
+  # shellcheck disable=SC2030  # the exported value is meant to stay in this subshell
+  _t_o=$( (DATA_BASE_DIR=/elsewhere; export DATA_BASE_DIR; read_site
+           printf '%s|%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR" "$CONFIG_OFFER_DIR") 2>&1)
+  [ "$_t_o" = "/var/db|/var/log||" ] || { echo "without a site file: '$_t_o'"; return 1; }
+  printf '%s\n' 'DATA_BASE_DIR="/srv/data"' 'LOG_BASE_DIR="/srv/log"' "CONFIG_SEARCH_DIR=\"$T_DIR/farm\"" \
+    "CONFIG_OFFER_DIR=\"$T_DIR/global\"" 'CONFIG_OFFER_NOTE="linked there by a run"' > "$SITE_CONF"
+  mkdir "$T_DIR/farm" && create_config "$T_DIR/farm/my-dd-clone" > /dev/null
+  _t_o=$( (read_site; load_config && printf '%s|%s|%s' "$_lc_file" "$STATE_DIR" "$EMERGENCY_LOG_DIR") 2>&1)
+  [ "$_t_o" = "$T_DIR/farm/my-dd-clone|/srv/data/$_t_u/my-dd-clone|/srv/log/$_t_u/my-dd-clone" ] \
+    || { echo "the bare name in the farm: '$_t_o'"; return 1; }
+  create_config "$T_DIR/farm/my-dd-clone.conf" > /dev/null
+  _t_o=$( (read_site; find_config && printf '%s' "$_lc_file") 2>&1)
+  [ "$_t_o" = "$T_DIR/farm/my-dd-clone.conf" ] || { echo ".conf before the bare name: '$_t_o'"; return 1; }
+  _t_o=$( (read_site; no_config_offer) 2>&1)
+  case $_t_o in
+    *"--create-config > $T_DIR/global/my-dd-clone.conf   (linked there by a run)"*) ;;
+    *) echo "the offer: '$_t_o'"; return 1 ;;
+  esac
+  chmod 000 "$SITE_CONF"
+  # shellcheck disable=SC2031  # read_site sets it in this same subshell
+  _t_o=$( (read_site; echo "went on with $DATA_BASE_DIR") 2>&1); _t_rc=$?
+  chmod 600 "$SITE_CONF"
+  case $_t_rc:$_t_o in
+    0:*|*"went on"*) echo "unreadable [rc $_t_rc]: '$_t_o'"; return 1 ;;
+  esac
+}
+
+# Every offered path is one the search reads -- the site's offer only where
+# its search directory is searched, the search directory itself never.
+t_config_offer_names_only_searched_paths() {
+  SITE_CONF="$T_DIR/site.conf"; HOME="$T_DIR/home"; _t_bad=
+  for _t_with in none site offer-only; do
+    rm -f "$SITE_CONF"
+    case $_t_with in
+      site) printf '%s\n' "CONFIG_SEARCH_DIR=\"$T_DIR/farm\"" "CONFIG_OFFER_DIR=\"$T_DIR/global\"" > "$SITE_CONF" ;;
+      offer-only) printf '%s\n' "CONFIG_OFFER_DIR=\"$T_DIR/global\"" > "$SITE_CONF" ;;
+    esac
+    read_site
+    while IFS= read -r _t_o; do
+      [ -n "$_t_o" ] || continue
+      case $_t_o in
+        "$T_DIR/farm/"*) _t_bad="$_t_bad $_t_with:$_t_o(the farm)" ;;
+        "$T_DIR/global/my-dd-clone.conf")
+          config_search_paths | grep -qx "$T_DIR/farm/my-dd-clone.conf" || _t_bad="$_t_bad $_t_with:$_t_o" ;;
+        *) config_search_paths | grep -qx "$_t_o" || _t_bad="$_t_bad $_t_with:$_t_o" ;;
+      esac
+    done <<EOF
+$(config_offer_paths)
+EOF
+    if [ "$_t_with" = site ] && ! config_offer_paths | grep -qx "$T_DIR/global/my-dd-clone.conf"; then
+      _t_bad="$_t_bad site:(its offer missing)"
+    fi
+  done
+  [ -z "$_t_bad" ] || { echo "offered but not searched:$_t_bad"; return 1; }
+}
+
+run_tests() {
+  # $1 = optional FILTER, a substring of the test names
+  _rt_sel=
+  for _rt_t in $T_LIST; do
+    case $_rt_t in *"$1"*) _rt_sel="$_rt_sel $_rt_t" ;; esac
+  done
+  _rt_n=0
+  for _rt_t in $_rt_sel; do _rt_n=$((_rt_n + 1)); done
+  printf '1..%s\n' "$_rt_n"
+  _rt_k=0; _rt_bad=0
+  for _rt_t in $_rt_sel; do
+    _rt_k=$((_rt_k + 1))
+    T_DIR=$(mktemp -d "${TMPDIR:-/tmp}/my-dd-clone.test.XXXXXX") || die "mktemp failed"
+    if _rt_out=$( ("$_rt_t") 2>&1 ); then
+      printf 'ok %s - %s\n' "$_rt_k" "$_rt_t"
+    else
+      printf 'not ok %s - %s\n' "$_rt_k" "$_rt_t"
+      printf '%s\n' "$_rt_out" | sed 's/^/# /'
+      _rt_bad=$((_rt_bad + 1))
+    fi
+    command rm -rf "$T_DIR"
+  done
+  printf '# %s of %s passed\n' "$((_rt_n - _rt_bad))" "$_rt_n"
+  [ "$_rt_bad" = 0 ]
+}
+
 # ------------------------------------------------------------------ main ----
 
 SRC_ARG=
@@ -1278,6 +1430,7 @@ while [ $# -gt 0 ]; do
     -h) usage_short; exit 0 ;;
     --help) usage; exit 0 ;;
     --version) _version_string; exit 0 ;;
+    --run-tests) run_tests "${2:-}"; exit $? ;;
     stamp-version) _stamp_version; exit 0 ;;
     -V|--verbose) VRB=1 ;;
     -D|--debug) DBG=1 ;;
@@ -1304,6 +1457,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ "$DBG" = 1 ] && VRB=1
+read_site
 
 # bare invocation: status when clone jobs exist, otherwise the short usage
 if [ "$ABORT" = 0 ] && [ "$CLEAR" = 0 ] && [ "$GO" = 0 ] && [ -z "$SRC_ARG" ]; then

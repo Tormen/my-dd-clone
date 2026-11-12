@@ -12,6 +12,7 @@ my-dd-clone [-V] --diff <SOURCE> <TARGET> [go]
 my-dd-clone [-V] [--clear]
 my-dd-clone -A|abort [JOB [TARGET]] [go]
 my-dd-clone --create-config [FILE]
+my-dd-clone --run-tests [FILTER]
 ```
 
 `SOURCE`: an APFS volume, as `/Volumes/<NAME>` or `<NAME>`.
@@ -38,7 +39,7 @@ bytes, not a UDIF image); attach later with
   good sectors are read exactly **once**, then only the bad areas get
   trim/scrape plus `DDRESCUE_RETRIES` retry passes — minimal stress on a
   failing source. Log and resume mapfile land under `EMERGENCY_LOG_DIR`
-  (default `/var/log/mine/$(id -un)/my-dd-clone`, sudo-created and chown'd
+  (default `$LOG_BASE_DIR/<user>/my-dd-clone`, sudo-created and chown'd
   to you if missing). Needs `brew install ddrescue`.
 - **Resume** — an unfinished run of the same SOURCE → TARGET pair makes
   `go` ask: type `resume` to continue (dd: skip/seek to the recorded
@@ -97,14 +98,23 @@ bytes, not a UDIF image); attach later with
 
 ## Config
 
-Standard search order (`$MY_DD_CLONE_CONFIG`, `--config FILE`,
-`/LINKS/default/my-dd-clone.conf`, `~/.my-dd-clone.conf`,
-`/etc/my-dd-clone.conf`, `/usr/local/etc/my-dd-clone.conf`); without one it
-lists the locations and exits. Create with
-`my-dd-clone --create-config /LINKS/default/my-dd-clone.conf`.
+Search order, first found wins: `$MY_DD_CLONE_CONFIG`, `--config FILE`,
+`$CONFIG_SEARCH_DIR/my-dd-clone.conf`, then `$CONFIG_SEARCH_DIR/my-dd-clone`,
+`~/.my-dd-clone.conf`, `/etc/my-dd-clone.conf`,
+`/usr/local/etc/my-dd-clone.conf`. Without one it offers where to write one
+(`my-dd-clone --create-config > <FILE>`), most common place first, and exits.
+
+`/LINKS/default/site.conf`, when it exists, is read first — plain
+`KEY="value"` lines: `CONFIG_SEARCH_DIR` (searched as above),
+`CONFIG_OFFER_DIR` and `CONFIG_OFFER_NOTE` (where "no config" offers one,
+only when `CONFIG_SEARCH_DIR` is set), `DATA_BASE_DIR` and `LOG_BASE_DIR`.
+Without it: `/var/db`, `/var/log`, no search directory, no such offer. There
+but unreadable: an error.
+
 Tunables: `DD_BS` (block size, default `4m`, plain dd only — it does NOT
-apply to `-E`), `STATE_DIR` (job records + logs) and `EMERGENCY_LOG_DIR`
-(`-E` log + mapfile), both defaulting to `/var/log/mine/$(id -un)/my-dd-clone`
+apply to `-E`), `STATE_DIR` (job records + logs, default
+`$DATA_BASE_DIR/<user>/my-dd-clone`) and `EMERGENCY_LOG_DIR` (`-E` log +
+mapfile, default `$LOG_BASE_DIR/<user>/my-dd-clone`)
 — per user under a root-owned parent, so other users can neither tamper
 with nor plant job records (which are sourced; only files owned by root
 or the invoking user are trusted), sudo-created on first `go` —
